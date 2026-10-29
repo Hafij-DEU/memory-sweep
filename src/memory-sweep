@@ -1,0 +1,2428 @@
+#!/usr/bin/python3
+"""Memory Sweep: see what fills your RAM, then end it or remove it.
+
+Usage:
+  memory-sweep [--page PAGE]       open the window; PAGE is overview, apps, files,
+                                   settings, memory (Memory Optimization) or about
+  memory-sweep report [--json]     print a summary
+  memory-sweep end KEY [--force]   end every instance of one app (KEY from report --json)
+"""
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import string
+import sys
+import threading
+import time
+from collections import defaultdict, deque
+
+APP_ID = "io.github.hafij_bge.MemorySweep"
+APP_NAME = "Memory Sweep"
+AUTHOR = "Md. Hafijur Rahman"
+AI_STATEMENT = (
+    "Memory Sweep was built with Vibe Coding. The author described the goal, constraints and "
+    "acceptance criteria in natural language. An AI coding agent (Claude Code, Anthropic, model "
+    "Claude Opus) then inspected the system, wrote the code and tests, ran them, and fixed defects. "
+    "The author reviewed the results and gave follow-up instructions.")
+VERSION = "1.2.0"
+PROC = "/proc"
+UID = os.getuid()
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+# tmpfs folders whose files the app may remove. /run/user/<uid> also lives in RAM,
+# but it holds the session's sockets (D-Bus, Wayland, PipeWire), so it is never offered.
+FILE_ROOTS = ("/tmp", "/dev/shm")
+REFRESH_SECONDS = 5
+SMALL_GROUP = 10 << 20
+SMALL_ITEM = 100 << 10
+
+NAMES = {
+    "brave": "Brave", "chrome": "Google Chrome", "chromium": "Chromium", "firefox": "Firefox",
+    "opera": "Opera", "claude-desktop": "Claude Desktop", "code": "VS Code",
+    "gnome-shell": "GNOME Shell", "nautilus": "Files", "Xwayland": "Xwayland",
+    "evolution-data-server": "Evolution data server", "gnome-software": "Software",
+    "snapd": "snapd", "packagekitd": "PackageKit",
+}
+HINTS = {
+    "gradle-daemon": "Build daemon, starts again on the next build",
+    "kotlin-daemon": "Build daemon, starts again on the next build",
+    "claude-code": "Each instance is one Claude Code session",
+    "brave": "Closing unused tabs also frees memory",
+    "chrome": "Closing unused tabs also frees memory",
+    "chromium": "Closing unused tabs also frees memory",
+    "firefox": "Closing unused tabs also frees memory",
+    "opera": "Closing unused tabs also frees memory",
+}
+# Processes the desktop session needs. Ending one logs you out or freezes the screen.
+PROTECTED = {
+    "systemd", "gnome-shell", "gnome-session-binary", "gnome-session-service", "gnome-session-ctl",
+    "dbus-daemon", "dbus-broker", "dbus-broker-launch", "pipewire", "pipewire-pulse", "wireplumber",
+    "Xwayland", "gdm-wayland-session", "gdm-x-session", "mutter-x11-frames", "at-spi-bus-launcher",
+    "at-spi2-registryd", "xdg-desktop-portal", "xdg-desktop-portal-gnome", "xdg-desktop-portal-gtk",
+    "xdg-permission-store", "xdg-document-portal", "gnome-keyring-daemon", "ibus-daemon", "gvfsd",
+    "gnome-shell-calendar-server", "goa-daemon", "dconf-service", "polkit-gnome-authentication-agent-1",
+    "mount.ntfs", "mount.ntfs-3g", "ntfs-3g", "sshfs", "rclone",
+}
+PROTECTED_PREFIXES = ("gsd-", "ibus-", "gvfs")
+INTERPRETER = re.compile(r"(python|node|java|perl|ruby|gjs|bun|bash|sh|dash)[\d.]*")
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def fmt_size(n):
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.1f} GB"
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.0f} MB"
+    return f"{n / 1024:.0f} KB"
+
+
+def fmt_age(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    if seconds < 86400:
+        h, m = divmod(seconds // 60, 60)
+        return f"{h} h {m} min" if m and h < 10 else f"{h} h"
+    return f"{seconds // 86400} d"
+
+
+# ---------------------------------------------------------------- system memory
+
+def meminfo():
+    """/proc/meminfo in bytes."""
+    out = {}
+    for line in _read(f"{PROC}/meminfo").splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts:
+            out[key] = int(parts[0]) * 1024
+    return out
+
+
+def zram():
+    """[(device, stored_bytes, ram_bytes)] for each zram swap in use."""
+    res = []
+    for line in _read(f"{PROC}/swaps").splitlines()[1:]:
+        dev = line.split()[0] if line.split() else ""
+        if "/zram" not in dev:
+            continue
+        st = _read(f"/sys/block/{os.path.basename(dev)}/mm_stat").split()
+        if len(st) >= 3:
+            res.append((dev, int(st[0]), int(st[2])))
+    return res
+
+
+def ram_mounts():
+    """[(mountpoint, used_bytes, total_bytes)] for the tmpfs folders in FILE_ROOTS."""
+    tmpfs = set()
+    for line in _read(f"{PROC}/mounts").splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[2] == "tmpfs":
+            tmpfs.add(f[1].replace("\\040", " "))
+    res = []
+    for mp in FILE_ROOTS:
+        if mp not in tmpfs:
+            continue
+        try:
+            st = os.statvfs(mp)
+        except OSError:
+            continue
+        res.append((mp, (st.f_blocks - st.f_bfree) * st.f_frsize, st.f_blocks * st.f_frsize))
+    return res
+
+
+def boot_time():
+    for line in _read(f"{PROC}/stat").splitlines():
+        if line.startswith("btime "):
+            return int(line.split()[1])
+    return 0
+
+
+# ---------------------------------------------------------------- processes
+
+class Proc:
+    __slots__ = ("pid", "ppid", "uid", "comm", "exe", "argv", "start", "ram", "swap")
+
+    def __init__(self, pid, ppid, uid, comm, exe, argv, start, ram, swap):
+        self.pid, self.ppid, self.uid, self.comm = pid, ppid, uid, comm
+        self.exe, self.argv, self.start, self.ram, self.swap = exe, argv, start, ram, swap
+
+    @property
+    def own(self):
+        return self.uid == UID
+
+    @property
+    def mem(self):
+        return self.ram + self.swap
+
+
+def read_proc(pid, btime=None):
+    base = f"{PROC}/{pid}"
+    raw = _read(base + "/stat")
+    if not raw:
+        return None
+    rp = raw.rfind(")")
+    comm = raw[raw.find("(") + 1:rp]
+    fields = raw[rp + 2:].split()
+    ppid = int(fields[1])
+    if pid == 2 or ppid == 2:
+        return None  # kernel threads
+    start = (btime if btime is not None else boot_time()) + int(fields[19]) / CLK_TCK
+    status = {}
+    for line in _read(base + "/status").splitlines():
+        key, _, rest = line.partition(":")
+        status[key] = rest.split()
+    uid = int(status.get("Uid", ["-1"])[0])
+    ram = int(status.get("VmRSS", ["0"])[0]) * 1024
+    swap = int(status.get("VmSwap", ["0"])[0]) * 1024
+    if uid == UID:
+        # PSS splits shared pages between the processes using them, so a browser's
+        # 35 processes add up to what the browser really costs.
+        roll = {}
+        for line in _read(base + "/smaps_rollup").splitlines():
+            key, _, rest = line.partition(":")
+            if rest.split():
+                roll[key] = int(rest.split()[0]) * 1024
+        if "Pss" in roll:
+            ram, swap = roll["Pss"], roll.get("SwapPss", swap)
+    try:
+        exe = os.readlink(base + "/exe").removesuffix(" (deleted)")
+    except OSError:
+        exe = ""
+    argv = [a for a in _read(base + "/cmdline").split("\0") if a]
+    return Proc(pid, ppid, uid, comm, exe, argv, start, ram, swap)
+
+
+def scan_procs():
+    btime = boot_time()
+    procs = []
+    for name in os.listdir(PROC):
+        if name.isdigit():
+            p = read_proc(int(name), btime)
+            if p:
+                procs.append(p)
+    return procs
+
+
+def _stem(path):
+    b = os.path.basename(path)
+    for ext in (".py", ".js", ".mjs", ".cjs", ".jar", ".sh"):
+        if b.endswith(ext):
+            return b[:-len(ext)]
+    return b
+
+
+def _script(interp, args):
+    """The script or program an interpreter runs, from its arguments."""
+    skip = False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if interp.startswith("python") and a == "-m" and i + 1 < len(args):
+            return args[i + 1]
+        if interp == "java" and a == "-jar" and i + 1 < len(args):
+            return _stem(args[i + 1])
+        if interp in ("bash", "sh", "dash") and a == "-c":
+            return None
+        if a in ("-cp", "-classpath", "--class-path", "-p", "--module-path", "-X", "-W", "-r", "--require"):
+            skip = True
+            continue
+        if a.startswith("-"):
+            continue
+        return a.rsplit(".", 1)[-1] if interp == "java" else _stem(a)
+    return None
+
+
+def label(p):
+    """(group key, title) for a process."""
+    cmd = " ".join(p.argv)
+    if "GradleDaemon" in cmd:
+        return "gradle-daemon", "Gradle daemon"
+    if "KotlinCompileDaemon" in cmd:
+        return "kotlin-daemon", "Kotlin daemon"
+    argv = p.argv
+    if len(argv) == 1 and " " in argv[0]:
+        argv = argv[0].split()  # the process rewrote its title, like "npm exec pkg"
+    # The exe link of other users' processes is unreadable; argv[0] beats the 15-char comm.
+    base = os.path.basename(p.exe) if p.exe else os.path.basename(argv[0]) if argv else p.comm
+    if base == "claude" and "claude-code" in p.exe:
+        return "claude-code", "Claude Code sessions"
+    if argv and os.path.basename(argv[0]) in ("npm", "npx"):
+        return "npm-exec", "npm"
+    m = INTERPRETER.fullmatch(base)
+    if m:
+        script = _script(m.group(1), argv[1:])
+        if script:
+            return f"{m.group(1)}:{script}", f"{script} ({m.group(1)})"
+    return base, NAMES.get(base, base)
+
+
+def is_protected(p):
+    names = {p.comm, os.path.basename(p.exe)}
+    return p.pid == 1 or bool(names & PROTECTED) or any(
+        n.startswith(PROTECTED_PREFIXES) for n in names if n)
+
+
+def self_and_ancestors():
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        p = read_proc(pid)
+        if not p:
+            break
+        pid = p.ppid
+    return pids
+
+
+class Instance:
+    """One running copy of an app: a root process and its same-app children."""
+
+    def __init__(self, root, procs, tree):
+        self.root, self.procs, self.tree = root, procs, tree
+
+    @property
+    def id(self):
+        return (self.root.pid, self.root.start)
+
+    @property
+    def ram(self):
+        return sum(p.ram for p in self.procs)
+
+    @property
+    def swap(self):
+        return sum(p.swap for p in self.procs)
+
+    @property
+    def mem(self):
+        return self.ram + self.swap
+
+
+class Group:
+    def __init__(self, key, title):
+        self.key, self.title = key, title
+        self.instances = []
+        self.locked = None  # why it cannot be ended, or None
+
+    @property
+    def procs(self):
+        return [p for i in self.instances for p in i.procs]
+
+    @property
+    def ram(self):
+        return sum(i.ram for i in self.instances)
+
+    @property
+    def swap(self):
+        return sum(i.swap for i in self.instances)
+
+    @property
+    def mem(self):
+        return self.ram + self.swap
+
+    @property
+    def hint(self):
+        return HINTS.get(self.key, "")
+
+
+def build_groups(procs, keep=frozenset()):
+    """Group processes by app. `keep` holds pids that must never be ended (this app)."""
+    by_pid = {p.pid: p for p in procs}
+    children = defaultdict(list)
+    for p in procs:
+        children[p.ppid].append(p)
+    keys, groups = {}, {}
+    titles = {}
+    for p in procs:
+        keys[p.pid], titles[p.pid] = label(p)
+    # Wrappers like "npm exec pkg" or "sh -c cmd" only wait for the one program they
+    # start; count them with that program. Repeat so npm -> sh -> node collapses fully.
+    wrappers = {"npm-exec", "sh", "dash", "bash"}
+    changed = True
+    while changed:
+        changed = False
+        for p in procs:
+            kids = children[p.pid]
+            if keys[p.pid] in wrappers and len(kids) == 1 and keys[kids[0].pid] not in wrappers:
+                keys[p.pid], titles[p.pid] = keys[kids[0].pid], titles[kids[0].pid]
+                changed = True
+    for p in procs:
+        groups.setdefault(keys[p.pid], Group(keys[p.pid], titles[p.pid]))
+
+    def walk(root, same_key):
+        out, stack = [], [root]
+        while stack:
+            p = stack.pop()
+            out.append(p)
+            stack.extend(c for c in children[p.pid] if not same_key or keys[c.pid] == keys[root.pid])
+        return out
+
+    for p in procs:
+        if keys.get(p.ppid) != keys[p.pid] or p.ppid not in by_pid:
+            groups[keys[p.pid]].instances.append(Instance(p, walk(p, True), walk(p, False)))
+    for g in groups.values():
+        g.instances.sort(key=lambda i: -i.mem)
+        ps = g.procs
+        if any(is_protected(p) for p in ps):
+            g.locked = "Needed by your desktop session"
+        elif not all(p.own for p in ps):
+            g.locked = "Runs as another user"
+        elif all(instance_locked(i, keep) for i in g.instances):
+            g.locked = instance_locked(g.instances[0], keep)
+    return sorted(groups.values(), key=lambda g: -g.mem)
+
+
+def instance_locked(inst, keep=frozenset()):
+    if not inst.root.own:
+        return "Runs as another user"
+    if is_protected(inst.root):
+        return "Needed by your desktop session"
+    if any(p.pid in keep for p in inst.tree):
+        if any(p.pid == os.getpid() for p in inst.procs):
+            return "This is Memory Sweep itself"
+        return "Memory Sweep was started from this app"
+    return None
+
+
+def alive(pid, start):
+    """True if `pid` still runs the process that started at `start` (zombies count as gone)."""
+    raw = _read(f"{PROC}/{pid}/stat")
+    if not raw:
+        return False
+    fields = raw[raw.rfind(")") + 2:].split()
+    return fields[0] not in ("Z", "X") and abs(boot_time() + int(fields[19]) / CLK_TCK - start) < 1
+
+
+def _send(pid, start, sig):
+    if alive(pid, start):  # guards against a reused pid
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def stop(instances, force=False, keep=frozenset(), wait=4.0):
+    """End app instances. Polite: SIGTERM the root, then its leftover children.
+    Force: SIGKILL the whole tree. Returns the (pid, start) pairs still running."""
+    targets = []
+    for inst in instances:
+        tree = [(p.pid, p.start) for p in inst.tree
+                if p.own and p.pid not in keep and not is_protected(p)]
+        targets.append((inst.id, tree))
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    for root, tree in targets:
+        for pid, start in (tree if force else [t for t in tree if t == root]):
+            _send(pid, start, sig)
+
+    def wait_for(pairs, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and any(alive(*t) for t in pairs):
+            time.sleep(0.2)
+
+    wait_for([r for r, tree in targets if r in tree], wait)
+    if not force:
+        rest = [t for _, tree in targets for t in tree if alive(*t)]
+        for t in rest:
+            _send(*t, signal.SIGTERM)
+        wait_for(rest, 1.5)
+    return [t for _, tree in targets for t in tree if alive(*t)]
+
+
+# ---------------------------------------------------------------- files in RAM
+
+class Item:
+    __slots__ = ("path", "size", "mtime", "is_dir", "own", "sockets", "note", "in_use")
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+
+def measure(path):
+    """(bytes on disk, newest mtime, sockets) without following symlinks."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0, 0, 0
+    size, newest = st.st_blocks * 512, st.st_mtime
+    sockets = 1 if stat.S_ISSOCK(st.st_mode) else 0
+    if not stat.S_ISDIR(st.st_mode):
+        return size, newest, sockets
+    stack = [path]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    s = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                size += s.st_blocks * 512
+                newest = max(newest, s.st_mtime)
+                if stat.S_ISSOCK(s.st_mode):
+                    sockets += 1
+                elif stat.S_ISDIR(s.st_mode) and s.st_dev == st.st_dev:
+                    stack.append(e.path)
+    return size, newest, sockets
+
+
+def describe(path):
+    name = os.path.basename(path)
+    claude = f"/tmp/claude-{UID}"
+    if path == claude:
+        return "Claude Code temp files"
+    if path.startswith(claude + "/"):
+        rel = path[len(claude) + 1:].split("/")
+        if len(rel) == 2 and UUID.fullmatch(rel[1]):
+            return "Claude Code session temp files"
+        if len(rel) == 3 and rel[2] == "scratchpad":
+            return "Claude Code session scratchpad"
+        if len(rel) == 1 and rel[0].startswith("-"):
+            return "Claude Code temp files for " + rel[0].replace("-", "/")
+    if "compile-cache" in name:
+        return "Compile cache, rebuilt when needed"
+    if name.startswith("hsperfdata_"):
+        return "Java performance data"
+    if name.endswith(".log"):
+        return "Log file"
+    if name.startswith(("kotlin-daemon", "gradle")):
+        return "Build tool temp files"
+    if name.startswith((".X11-unix", ".ICE-unix", ".XIM-unix", ".font-unix")):
+        return "Display server sockets"
+    if name.startswith("systemd-private-"):
+        return "Private temp folder of a system service"
+    if name.startswith("snap-private-tmp"):
+        return "Snap apps' private temp folders"
+    return ""
+
+
+def busy_markers():
+    """Working folders and argument words of your processes, to spot folders in use."""
+    cwds, words = set(), set()
+    for name in os.listdir(PROC):
+        if not name.isdigit():
+            continue
+        try:
+            cwds.add(os.readlink(f"{PROC}/{name}/cwd"))
+        except OSError:
+            continue
+        for a in _read(f"{PROC}/{name}/cmdline").split("\0"):
+            words.update(UUID.findall(a))
+    return cwds, words
+
+
+def list_items(folder=None, markers=None):
+    """Items in `folder`, or the top level of every RAM folder, biggest first."""
+    folders = [folder] if folder else [mp for mp, _, _ in ram_mounts()]
+    cwds, words = markers or busy_markers()
+    items = []
+    for d in folders:
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            it = Item()
+            it.path = e.path
+            it.size, it.mtime, it.sockets = measure(e.path)
+            try:
+                st = e.stat(follow_symlinks=False)
+                it.is_dir = stat.S_ISDIR(st.st_mode)
+                it.own = st.st_uid == UID
+            except OSError:
+                it.is_dir, it.own = False, False
+            it.note = describe(e.path)
+            it.in_use = any(c == e.path or c.startswith(e.path + "/") for c in cwds) or \
+                bool(UUID.fullmatch(it.name) and it.name in words)
+            items.append(it)
+    items.sort(key=lambda i: -i.size)
+    return items
+
+
+def hidden_usage(items, mounts):
+    """{mountpoint: bytes} used in each RAM folder but not visible as files: deleted files
+    still open in running apps (browsers keep shared memory like this) or unreadable folders."""
+    out = {}
+    for mp, used, _ in mounts:
+        seen = sum(i.size for i in items if i.path.startswith(mp + "/"))
+        if used - seen >= 20 << 20:
+            out[mp] = used - seen
+    return out
+
+
+def removable(path):
+    """None if `path` may be removed, else the reason it may not."""
+    parent = os.path.realpath(os.path.dirname(path))
+    full = os.path.join(parent, os.path.basename(path))
+    roots = [mp for mp, _, _ in ram_mounts()]
+    if not any(full.startswith(r + "/") for r in roots):
+        return "Only files in " + " and ".join(FILE_ROOTS) + " can be removed"
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return "It is already gone"
+    if st.st_uid != UID:
+        return "It belongs to another user"
+    return None
+
+
+def remove(path):
+    """Delete a file or folder in a RAM folder. Returns the number of entries left behind."""
+    why = removable(path)
+    if why:
+        raise PermissionError(why)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(path)
+        return 0
+    failed = []
+    shutil.rmtree(path, onexc=lambda fn, p, exc: failed.append(p))
+    return len(failed)
+
+
+# ---------------------------------------------------------------- snapshot
+
+class Snapshot:
+    def __init__(self, keep=frozenset()):
+        self.mem = meminfo()
+        self.zram = zram()
+        self.mounts = ram_mounts()
+        self.swaps = swaps()
+        self.groups = build_groups(scan_procs(), keep)
+        self.time = time.time()
+
+    @property
+    def total(self):
+        return self.mem.get("MemTotal", 0)
+
+    @property
+    def available(self):
+        return self.mem.get("MemAvailable", 0)
+
+    @property
+    def used(self):
+        return self.total - self.available
+
+    @property
+    def swap_total(self):
+        return self.mem.get("SwapTotal", 0)
+
+    @property
+    def swap_used(self):
+        return self.swap_total - self.mem.get("SwapFree", 0)
+
+    def swap_parts(self, zram):
+        """(size, used) of the zram devices, or of the other swap devices."""
+        parts = [s for s in self.swaps if ("/zram" in s[0]) == zram]
+        return sum(s[2] for s in parts), sum(s[3] for s in parts)
+
+    def tips(self):
+        """[(kind, text, page, group key or None)] suggestions, most useful first."""
+        tips = []
+        in_ram = sum(u for _, u, _ in self.mounts)
+        if in_ram >= 300 << 20:
+            where = " and ".join(mp for mp, u, _ in self.mounts if u >= 50 << 20) or "/tmp"
+            tips.append(("files", f"{fmt_size(in_ram)} of files in {where} are held in RAM",
+                         "files", None))
+        for g in self.groups:
+            if g.key in ("gradle-daemon", "kotlin-daemon") and not g.locked:
+                tips.append(("end", f"{g.title} uses {fmt_size(g.mem)} and starts again on the next build",
+                             "apps", g.key))
+        for g in self.groups:
+            if g.key == "claude-code" and len(g.instances) >= 3:
+                oldest = min(i.root.start for i in g.instances)
+                tips.append(("apps", f"{len(g.instances)} Claude Code sessions use {fmt_size(g.mem)}; "
+                             f"the oldest started {fmt_age(self.time - oldest)} ago", "apps", g.key))
+        for g in self.groups[:3]:
+            if g.key in HINTS and g.key not in ("gradle-daemon", "kotlin-daemon", "claude-code") \
+                    and g.mem >= 1 << 30:
+                tips.append(("apps", f"{g.title} uses {fmt_size(g.mem)} in {len(g.procs)} processes",
+                             "apps", g.key))
+        if not self.swap_parts(zram=True)[0] and self.total and self.used >= 0.75 * self.total:
+            tips.append(("zram", "zram is off. Compressed swap in RAM gives you room before apps slow down",
+                         "memory", None))
+        return tips
+
+
+# ---------------------------------------------------------------- swap, zram and zswap
+
+SWAP_HELPER = "/usr/libexec/memory-sweep/memory-sweep-swap"
+ZRAM_CONF = "/etc/default/zramswap"
+ZRAMSWAP = "/usr/sbin/zramswap"
+ZSWAP_PARAMS = "/sys/module/zswap/parameters"
+ZRAM_DOCS = "https://docs.kernel.org/admin-guide/blockdev/zram.html"
+ALGOS = ("lz4", "zstd", "lzo-rle")
+# What "Reset to defaults" puts in the form: half of RAM as zram (the zram-tools default
+# of 256 MB is too small to matter), Ubuntu's 4 GB swap file and the kernel's vm values.
+DEFAULTS = {"zram": 50, "algo": "zstd", "file": 4, "zswap": False, "swappiness": 60,
+            "cache_pressure": 100}
+# Exit codes of the helper (src/memory-sweep-swap).
+SWAP_ERRORS = {
+    2: "The helper refused these values",
+    3: "Not enough free disk space for that swap file",
+    4: "Not enough free RAM to take back what is in swap now. Close some apps first",
+    5: "Swap files on btrfs need extra steps, so Memory Sweep leaves them alone",
+    6: "zram-tools is not installed",
+    7: "This kernel has no zswap",
+    8: "apt-get failed. Check the internet connection and try again",
+}
+
+
+def swaps():
+    """[(device, kind, size_bytes, used_bytes)] from /proc/swaps."""
+    res = []
+    for line in _read(f"{PROC}/swaps").splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 4:
+            res.append((f[0].replace("\\040", " "), f[1], int(f[2]) * 1024, int(f[3]) * 1024))
+    return res
+
+
+def _number(path, default):
+    try:
+        return int(_read(path).strip())
+    except ValueError:
+        return default
+
+
+def zram_conf():
+    """The active KEY=VALUE lines of the zram-tools config."""
+    conf = {}
+    for line in _read(ZRAM_CONF).splitlines():
+        key, eq, value = line.strip().partition("=")
+        if eq and key and not key.startswith("#"):
+            conf[key] = value.strip().strip("\"'")
+    return conf
+
+
+def _fstab_swap_file():
+    for line in _read("/etc/fstab").splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[2] == "swap" and f[0].startswith("/") and not f[0].startswith("/dev/"):
+            return f[0]
+    return None
+
+
+def swap_status():
+    """What the Memory Optimization page shows and starts the form from."""
+    total = meminfo().get("MemTotal", 0)
+    sw = swaps()
+    zr = [s for s in sw if "/zram" in s[0]]
+    files = [s for s in sw if s[1] == "file"]
+    conf = zram_conf()
+    zsize = sum(s[2] for s in zr)
+    try:
+        percent = int(conf.get("PERCENT", ""))
+    except ValueError:
+        percent = round(zsize * 100 / total) if total and zsize else 0
+    path = files[0][0] if files else _fstab_swap_file()
+    size = files[0][2] if files else (os.path.getsize(path) if path and os.path.isfile(path) else 0)
+    try:
+        free = shutil.disk_usage(os.path.dirname(path or "/swap.img")).free
+    except OSError:
+        free = 0
+    zswap = _read(f"{ZSWAP_PARAMS}/enabled").strip()
+    stats = zram()
+    return {
+        "ram": total,
+        "tools": os.path.isfile(ZRAM_CONF) and os.access(ZRAMSWAP, os.X_OK),
+        "zram_on": bool(zr), "zram_percent": percent,
+        "algo": conf.get("ALGO") if conf.get("ALGO") in ALGOS else "lz4",
+        "zram_size": zsize, "zram_used": sum(s[3] for s in zr),
+        "zram_stored": sum(s for _, s, _ in stats), "zram_ram": sum(r for _, _, r in stats),
+        "file": path, "file_size": size, "file_used": files[0][3] if files else 0,
+        "file_active": bool(files), "disk_free": free,
+        "zswap": None if not zswap else zswap in ("Y", "1"),
+        "zswap_compressor": _read(f"{ZSWAP_PARAMS}/compressor").strip(),
+        "swappiness": _number(f"{PROC}/sys/vm/swappiness", 60),
+        "cache_pressure": _number(f"{PROC}/sys/vm/vfs_cache_pressure", 100),
+    }
+
+
+def swap_form(st):
+    """The form values that match the system as it is now."""
+    return {
+        "tools": None,  # None, "install", "reinstall" or "remove"
+        "zram": st["zram_percent"] if st["zram_on"] else 0,
+        "algo": st["algo"],
+        "file": max(1, round(st["file_size"] / (1 << 30))) if st["file_size"] else 0,
+        "zswap": bool(st["zswap"]),
+        "swappiness": st["swappiness"],
+        "cache_pressure": st["cache_pressure"],
+    }
+
+
+def plan_changes(st, form):
+    """Helper arguments that turn the system `st` into what `form` asks for."""
+    now = swap_form(st)
+    tools = form.get("tools")
+    args = [f"tools={tools}"] if tools else []
+    has_tools = (st["tools"] or tools in ("install", "reinstall")) and tools != "remove"
+    # A fresh zram-tools starts zram at its own size; set the asked one right after.
+    if has_tools and (tools == "install" or (form["zram"], form["algo"]) != (now["zram"], now["algo"])):
+        args.append(f"zram={form['zram']}:{form['algo']}")
+    if form["file"] >= 1 and form["file"] != now["file"]:
+        args.append(f"file={form['file']}")
+    if st["zswap"] is not None and form["zswap"] != now["zswap"]:
+        args.append(f"zswap={int(form['zswap'])}")
+    for key in ("swappiness", "cache_pressure"):
+        if form[key] != now[key]:
+            args.append(f"{key}={form[key]}")
+    return args
+
+
+def describe_change(arg):
+    """One helper argument in words."""
+    key, _, value = arg.partition("=")
+    if key == "tools":
+        return {"install": "Install zram-tools", "reinstall": "Reinstall zram-tools",
+                "remove": "Remove zram-tools and turn zram off"}[value]
+    if key == "zram":
+        percent, _, algo = value.partition(":")
+        return "Turn zram off" if percent == "0" else f"zram at {percent}% of RAM, packed with {algo}"
+    if key == "file":
+        return f"Swap file of {value} GB"
+    if key == "zswap":
+        return "Turn zswap on" if value == "1" else "Turn zswap off"
+    if key == "swappiness":
+        return f"Swappiness {value}"
+    return f"Cache pressure {value}"
+
+
+def swap_command(args):
+    """pkexec command line for the helper. The installed copy has its own polkit
+    action; a source checkout runs the copy next to this file through sh."""
+    if os.access(SWAP_HELPER, os.X_OK):
+        return ["pkexec", SWAP_HELPER, *args]
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "memory-sweep-swap")
+    return ["pkexec", "/bin/sh", here, *args]
+
+
+def usage_sample():
+    """(RAM %, swap file or partition %, zram %) now; cheap enough for every 2 s."""
+    m = meminfo()
+    total = m.get("MemTotal", 0)
+    ram = 100 * (total - m.get("MemAvailable", 0)) / total if total else 0
+    disk, comp = [0, 0], [0, 0]
+    for dev, _, size, used in swaps():
+        t = comp if "/zram" in dev else disk
+        t[0] += size
+        t[1] += used
+    return ram, 100 * disk[1] / disk[0] if disk[0] else 0, 100 * comp[1] / comp[0] if comp[0] else 0
+
+
+# ---------------------------------------------------------------- settings
+
+SETTINGS = {"refresh": 5, "start_page": "overview", "theme": "dark", "notify": True, "notify_at": 90}
+
+
+def settings_file():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "memory-sweep", "settings.json")
+
+
+def load_settings():
+    s = dict(SETTINGS)
+    try:
+        with open(settings_file()) as f:
+            data = json.load(f)
+        s.update({k: v for k, v in data.items() if k in SETTINGS and type(v) is type(SETTINGS[k])})
+    except (OSError, ValueError, AttributeError):
+        pass
+    return s
+
+
+def save_settings(s):
+    path = settings_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(s, f, indent=2)
+    os.replace(path + ".tmp", path)
+
+
+# ---------------------------------------------------------------- CLI
+
+def end_app(key, force=False):
+    """End every unlocked instance of the app group `key`. Prints JSON; exit 0 = gone,
+    1 = some processes still run, 2 = no such app or it is locked."""
+    keep = frozenset(self_and_ancestors())
+    group = next((g for g in build_groups(scan_procs(), keep) if g.key == key), None)
+    if group is None or group.locked:
+        print(json.dumps({"key": key, "error": group.locked if group else "No such app is running"}))
+        return 2
+    instances = [i for i in group.instances if not instance_locked(i, keep)]
+    left = stop(instances, force=force, keep=keep)
+    print(json.dumps({"key": key, "title": group.title, "freed": sum(i.mem for i in instances),
+                      "left": len(left)}))
+    return 1 if left else 0
+
+
+def report(as_json=False):
+    snap = Snapshot(self_and_ancestors())
+    items = [i for i in list_items() if i.size >= 10 << 20]
+    if as_json:
+        print(json.dumps({
+            "ram": {"total": snap.total, "used": snap.used, "available": snap.available},
+            "swap": {"total": snap.swap_total, "used": snap.swap_used},
+            "zram": [{"device": d, "stored": s, "ram": r} for d, s, r in snap.zram],
+            "ram_folders": [{"path": mp, "used": u, "size": t} for mp, u, t in snap.mounts],
+            "apps": [{"key": g.key, "title": g.title, "ram": g.ram, "swap": g.swap,
+                      "processes": len(g.procs), "instances": len(g.instances), "locked": g.locked}
+                     for g in snap.groups if g.mem >= SMALL_GROUP],
+            "files": [{"path": i.path, "size": i.size, "mine": i.own, "in_use": i.in_use,
+                       "note": i.note} for i in items],
+            "tips": [{"kind": k, "text": t, "page": pg, "key": key} for k, t, pg, key in snap.tips()],
+        }, indent=2))
+        return
+    print(f"RAM   {fmt_size(snap.used)} of {fmt_size(snap.total)} used, "
+          f"{fmt_size(snap.available)} available")
+    print(f"Swap  {fmt_size(snap.swap_used)} of {fmt_size(snap.swap_total)} used")
+    for dev, stored, ram in snap.zram:
+        print(f"zram  {dev}: {fmt_size(stored)} stored in {fmt_size(ram)} of RAM")
+    for mp, used, total in snap.mounts:
+        print(f"Files {mp}: {fmt_size(used)} held in RAM")
+    print("\nApps")
+    for g in snap.groups[:15]:
+        n = len(g.instances)
+        extra = f", {n} instances" if n > 1 else ""
+        n = len(g.procs)
+        print(f"  {fmt_size(g.mem):>9}  {g.title} ({n} process{'es' if n != 1 else ''}{extra})")
+    hidden = hidden_usage(list_items(), snap.mounts)
+    for mp, n in hidden.items():
+        print(f"      {mp}: {fmt_size(n)} of it is not visible as files (kept open by running apps)")
+    if items:
+        print("\nFiles in RAM")
+        for i in items[:15]:
+            print(f"  {fmt_size(i.size):>9}  {i.path}" + (f"  [{i.note}]" if i.note else ""))
+    tips = snap.tips()
+    if tips:
+        print("\nSuggestions")
+        for _, text, _, _ in tips:
+            print("  - " + text)
+
+
+# ---------------------------------------------------------------- GUI
+
+PALETTES = {
+    "dark": {"bg": "#0b1220", "side": "#0d1526", "card": "#111a2e", "raised": "#18233b",
+             "border": "#1f2b45", "fg": "#e7ecf6", "dim": "#8b97b1", "track": "#1c2740",
+             "accent": "#60a5fa"},
+    "light": {"bg": "#f4f6fb", "side": "#ffffff", "card": "#ffffff", "raised": "#eef2f9",
+              "border": "#e2e8f2", "fg": "#0f172a", "dim": "#64748b", "track": "#e6ebf3",
+              "accent": "#2563eb"},
+}
+COLORS = {"blue": "#3b82f6", "purple": "#8b5cf6", "green": "#22c55e", "orange": "#f59e0b",
+          "red": "#ef4444"}
+# Sidebar pages; the first three are also the header tabs.
+PAGES = (("overview", "Overview", "view-grid-symbolic"),
+         ("apps", "Apps", "preferences-desktop-apps-symbolic"),
+         ("files", "Files in RAM", "folder-symbolic"),
+         ("settings", "Settings", "emblem-system-symbolic"),
+         ("about", "About", "help-about-symbolic"))
+TABS = ("overview", "apps", "files")
+SETTING_PAGES = (("general", "General", "preferences-system-symbolic"),
+                 ("appearance", "Appearance", "preferences-desktop-appearance-symbolic"),
+                 ("memory", "Memory Optimization", "ms-zram-symbolic"),
+                 ("notifications", "Notifications", "preferences-system-notifications-symbolic"))
+CHART_SPANS = ((60, "Last 60 seconds"), (300, "Last 5 minutes"), (900, "Last 15 minutes"))
+SAMPLE_SECONDS = 2
+REFRESH_CHOICES = (2, 5, 10)
+
+CSS = string.Template("""
+:root {
+  --window-bg-color: $bg; --window-fg-color: $fg;
+  --view-bg-color: $bg; --view-fg-color: $fg;
+  --headerbar-bg-color: $bg; --headerbar-fg-color: $fg; --headerbar-backdrop-color: $bg;
+  --headerbar-shade-color: transparent; --headerbar-darker-shade-color: $border;
+  --sidebar-bg-color: $side; --sidebar-fg-color: $fg; --sidebar-backdrop-color: $side;
+  --sidebar-border-color: $border; --sidebar-shade-color: transparent;
+  --card-bg-color: $card; --card-fg-color: $fg; --card-shade-color: $border;
+  --popover-bg-color: $card; --popover-fg-color: $fg;
+  --dialog-bg-color: $card; --dialog-fg-color: $fg;
+  --accent-bg-color: #3b82f6; --accent-fg-color: #ffffff; --accent-color: $accent;
+  --border-color: $border;
+}
+.ms-brand { font-weight: 800; font-size: 13pt; }
+.ms-nav, .ms-nav > row, .ms-list, .ms-list > row { background: transparent; }
+.ms-nav > row { border-radius: 10px; padding: 10px 12px; margin: 2px 0; color: $dim; }
+.ms-nav > row:hover { background: $raised; color: $fg; }
+.ms-nav > row:selected { background: alpha(#3b82f6, 0.16); color: $accent; font-weight: 700; }
+.ms-h1 { font-size: 20pt; font-weight: 800; }
+.ms-h2 { font-size: 12.5pt; font-weight: 700; }
+.ms-strong { font-weight: 700; }
+.ms-dim { color: $dim; }
+.ms-small { font-size: 9pt; }
+.ms-num, .size { font-feature-settings: "tnum"; }
+.ms-value { font-size: 22pt; font-weight: 800; font-feature-settings: "tnum"; }
+.ms-card { background: $card; border: 1px solid $border; border-radius: 16px; padding: 18px; }
+.ms-click:hover { background: $raised; }
+.ms-flow > flowboxchild { padding: 0; background: none; }
+.ms-icon { border-radius: 999px; min-width: 40px; min-height: 40px; }
+.ms-icon.small { min-width: 34px; min-height: 34px; }
+.ms-icon.blue { background: alpha(#3b82f6, 0.16); color: #3b82f6; }
+.ms-icon.purple { background: alpha(#8b5cf6, 0.16); color: #8b5cf6; }
+.ms-icon.green { background: alpha(#22c55e, 0.16); color: #22c55e; }
+.ms-icon.orange { background: alpha(#f59e0b, 0.16); color: #f59e0b; }
+.ms-icon.red { background: alpha(#ef4444, 0.16); color: #ef4444; }
+progressbar.ms-bar > trough { min-height: 8px; min-width: 40px; border-radius: 99px; background: $track; }
+progressbar.ms-bar > trough > progress { min-height: 8px; border-radius: 99px; background: #3b82f6; }
+progressbar.ms-bar.thin > trough, progressbar.ms-bar.thin > trough > progress { min-height: 6px; }
+progressbar.ms-bar.purple > trough > progress { background: #8b5cf6; }
+progressbar.ms-bar.green > trough > progress { background: #22c55e; }
+progressbar.ms-bar.orange > trough > progress { background: #f59e0b; }
+progressbar.ms-bar.red > trough > progress { background: #ef4444; }
+.ms-pill { border-radius: 99px; padding: 4px 12px; font-weight: 700; font-size: 9.5pt; }
+.ms-pill.green { background: alpha(#22c55e, 0.14); color: #22c55e; }
+.ms-pill.orange { background: alpha(#f59e0b, 0.14); color: #f59e0b; }
+.ms-pill.red { background: alpha(#ef4444, 0.14); color: #ef4444; }
+.ms-pill.blue { background: alpha(#3b82f6, 0.14); color: $accent; }
+.ms-pill.dim { background: $raised; color: $dim; }
+.ms-banner { background: alpha(#3b82f6, 0.10); border: 1px solid alpha(#3b82f6, 0.35); border-radius: 14px; padding: 14px 16px; }
+.ms-warn { background: alpha(#f59e0b, 0.10); border: 1px solid alpha(#f59e0b, 0.35); border-radius: 12px; padding: 10px 12px; }
+.ms-warn image { color: #f59e0b; }
+separator.ms-sep { background: $border; min-height: 1px; }
+.ms-list > row { border-radius: 10px; padding: 7px 6px; }
+.ms-list > row:hover { background: $raised; }
+.ms-head { color: $dim; font-size: 9pt; font-weight: 700; }
+.ms-dot { border-radius: 99px; min-width: 10px; min-height: 10px; }
+.ms-dot.blue { background: #3b82f6; }
+.ms-dot.purple { background: #8b5cf6; }
+.ms-dot.green { background: #22c55e; }
+button.ms-link { color: $accent; font-weight: 700; }
+""")
+
+
+def run_gui(page):
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    gi.require_version("Gsk", "4.0")
+    gi.require_version("Graphene", "1.0")
+    from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango
+
+    keep = frozenset(self_and_ancestors())
+    V = Gtk.Orientation.VERTICAL
+    CENTER = Gtk.Align.CENTER
+
+    def label(text="", *classes, xalign=0, **kw):
+        lbl = Gtk.Label(label=text, xalign=xalign, **kw)
+        for c in classes:
+            lbl.add_css_class(c)
+        return lbl
+
+    def size_label(text=""):
+        return label(text, "size", "dim-label", valign=CENTER)
+
+    def end_button(cb, text="End"):
+        b = Gtk.Button(label=text, valign=CENTER)
+        b.add_css_class("flat")
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def badge(icon, color, small=False):
+        # hexpand/vexpand=False: the centred image inside would otherwise make the badge, and the
+        # card holding it, grab spare width and height.
+        b = Gtk.Box(halign=Gtk.Align.START, valign=CENTER, hexpand=False, vexpand=False)
+        for c in ("ms-icon", color) + (("small",) if small else ()):
+            b.add_css_class(c)
+        b.append(Gtk.Image(icon_name=icon, pixel_size=16 if small else 18,
+                           hexpand=True, vexpand=True, halign=CENTER, valign=CENTER))
+        return b
+
+    def bar(color="blue", thin=False):
+        pb = Gtk.ProgressBar(valign=CENTER)
+        for c in ("ms-bar", color) + (("thin",) if thin else ()):
+            pb.add_css_class(c)
+        return pb
+
+    def card(spacing=12, vertical=True, **kw):
+        c = Gtk.Box(orientation=V if vertical else Gtk.Orientation.HORIZONTAL, spacing=spacing, **kw)
+        c.add_css_class("ms-card")
+        return c
+
+    def sep():
+        s = Gtk.Separator()
+        s.add_css_class("ms-sep")
+        return s
+
+    def link(text, cb):
+        b = Gtk.Button(label=text, valign=CENTER)
+        b.add_css_class("flat")
+        b.add_css_class("ms-link")
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def clickable(widget, cb):
+        widget.add_css_class("ms-click")
+        widget.set_cursor_from_name("pointer")
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: cb())
+        widget.add_controller(click)
+
+    def pill(lbl, color, text):
+        lbl.set_css_classes(["ms-pill", color])
+        lbl.set_label(text)
+
+    def open_uri(window, uri):
+        Gtk.UriLauncher(uri=uri).launch(window, None, None)
+
+    def rgba(hex_color, alpha=1.0):
+        c = Gdk.RGBA()
+        c.parse(hex_color)
+        c.alpha = alpha
+        return c
+
+    class Chart(Gtk.Widget):
+        """Line chart drawn by `draw(widget, snapshot, width, height)`."""
+
+        def __init__(self, draw):
+            super().__init__(height_request=240, vexpand=True, hexpand=True)
+            self.draw = draw
+
+        def do_snapshot(self, snapshot):
+            self.draw(self, snapshot, self.get_width(), self.get_height())
+
+    class AppIcons:
+        """Icon of the installed app that matches a group key, if any."""
+
+        def __init__(self):
+            self.cache = {}
+            self.apps = None
+
+        def get(self, key):
+            if key not in self.cache:
+                if self.apps is None:
+                    self.apps = [a for a in Gio.AppInfo.get_all() if a.get_icon()]
+                k = key.lower()
+                self.cache[key] = None
+                for a in self.apps:
+                    aid = (a.get_id() or "").lower().removesuffix(".desktop")
+                    exe = os.path.basename(a.get_executable() or "").lower()
+                    if k in (aid, exe, aid.rsplit(".", 1)[-1], aid.rsplit("_", 1)[-1]):
+                        self.cache[key] = a.get_icon()
+                        break
+            return self.cache[key]
+
+    class StatCard(Gtk.Box):
+        def __init__(self, title, icon, color, columns, on_click=None):
+            super().__init__(orientation=V, spacing=12, width_request=210)
+            self.add_css_class("ms-card")
+            top = Gtk.Box(spacing=12)
+            top.append(badge(icon, color))
+            names = Gtk.Box(orientation=V, valign=CENTER, hexpand=True)
+            names.append(label(title, "ms-h2"))
+            self.sub = label("", "ms-dim", "ms-small", ellipsize=Pango.EllipsizeMode.END)
+            names.append(self.sub)
+            top.append(names)
+            if on_click:
+                top.append(Gtk.Image(icon_name="go-next-symbolic", css_classes=["ms-dim"]))
+                clickable(self, on_click)
+            self.append(top)
+            self.value = label("", "ms-value")
+            self.append(self.value)
+            self.bar = bar(color)
+            self.append(self.bar)
+            row = Gtk.Box(homogeneous=True, spacing=8)
+            self.cols = []
+            for name in columns:
+                col = Gtk.Box(orientation=V, spacing=2)
+                col.append(label(name, "ms-dim", "ms-small"))
+                v = label("", "ms-num", ellipsize=Pango.EllipsizeMode.END)
+                col.append(v)
+                row.append(col)
+                self.cols.append(v)
+            self.append(row)
+
+        def update(self, value, fraction, sub, values):
+            self.value.set_label(value)
+            self.bar.set_fraction(max(0, min(1, fraction)))
+            self.sub.set_label(sub)
+            for lbl, v in zip(self.cols, values):
+                lbl.set_label(v)
+
+    class Window(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title=APP_NAME, default_width=1280, default_height=860)
+            self.app = app
+            self.settings = app.settings
+            self.snap = None
+            self.scanning = False
+            self.busy = set()  # instance ids being ended
+            self.group_rows = {}
+            self.folder = None
+            self.files_loaded = False
+            self.syncing = False
+            self.history = deque(maxlen=CHART_SPANS[-1][0] // SAMPLE_SECONDS + 2)
+            self.status = None
+            self.form = None
+            self.pending = []
+            self.applying = False
+            self.tips_shown = None
+            self.all_tips = False
+            self.last_notified = 0
+            self.timer = 0
+            self.icons = AppIcons()
+            self.narrow = []  # (widget, property, narrow value)
+            self.narrow_large = []  # the same, for parts that stack below 1400 sp
+
+            self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                                   transition_duration=150)
+            self.stack.add_named(self._overview(), "overview")
+            self.stack.add_named(self._apps(), "apps")
+            self.stack.add_named(self._files(), "files")
+            self.stack.add_named(self._settings(), "settings")
+            self.stack.add_named(self._about(), "about")
+            self.toasts = Adw.ToastOverlay(child=self.stack)
+
+            self.tabs = Adw.ToggleGroup(valign=CENTER)
+            for name, title, _ in PAGES:
+                if name in TABS:
+                    self.tabs.add(Adw.Toggle(name=name, label=title))
+            self.tabs.connect("notify::active-name",
+                              lambda *_: self.syncing or self.show_page(self.tabs.get_active_name()))
+            self.header_title = Adw.WindowTitle()
+            self.header = Adw.HeaderBar(title_widget=self.tabs)
+            self.sidebar_btn = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", tooltip_text="Sidebar",
+                                                visible=False)
+            self.header.pack_start(self.sidebar_btn)
+            content = Adw.ToolbarView(content=self.toasts)
+            content.add_top_bar(self.header)
+
+            self.nav = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+            self.nav.add_css_class("ms-nav")
+            self.nav_rows = {}
+            for name, title, icon in PAGES:
+                row = self._nav_row(title, icon)
+                row.name = name
+                self.nav.append(row)
+                self.nav_rows[name] = row
+            self.nav.connect("row-selected", lambda _l, r: r and not self.syncing and self.show_page(r.name))
+            brand = Gtk.Box(spacing=10)
+            brand.append(Gtk.Image(icon_name=APP_ID, pixel_size=28))
+            brand.append(label(APP_NAME, "ms-brand"))
+            side_header = Adw.HeaderBar(title_widget=brand, show_end_title_buttons=False)
+            side = Gtk.Box(orientation=V, margin_top=8, margin_bottom=14, margin_start=12, margin_end=12)
+            side.append(self.nav)
+            side.append(Gtk.Box(vexpand=True))
+            side.append(label(f"Version {VERSION}", "ms-dim", "ms-small", margin_start=12))
+            side_view = Adw.ToolbarView(content=side)
+            side_view.add_top_bar(side_header)
+
+            self.split = Adw.OverlaySplitView(sidebar=side_view, content=content,
+                                              min_sidebar_width=220, max_sidebar_width=250)
+            self.split.bind_property("show-sidebar", self.sidebar_btn, "active",
+                                           GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE)
+            self.set_content(self.split)
+
+            # Below 1400 sp the Memory Optimization form stacks, below 1200 sp the other two-column
+            # parts do too, and below 900 sp the sidebar folds away. Only the last matching
+            # breakpoint applies, so each one repeats the setters of the wider ones.
+            large = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 1400sp"))
+            medium = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 1200sp"))
+            small = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 900sp"))
+            for bp, setters in ((large, self.narrow_large), (medium, self.narrow_large + self.narrow),
+                                (small, self.narrow_large + self.narrow)):
+                for widget, prop, value in setters:
+                    bp.add_setter(widget, prop, value)
+                self.add_breakpoint(bp)
+            small.add_setter(self.split, "collapsed", True)
+            small.add_setter(self.sidebar_btn, "visible", True)
+
+            self.refresh()
+            self._sample()
+            self._restart_timer()
+            GLib.timeout_add_seconds(SAMPLE_SECONDS, self._sample)
+            self.show_page(page or self.settings["start_page"])
+
+        # ---- building blocks
+
+        def _nav_row(self, title, icon):
+            row = Gtk.ListBoxRow()
+            b = Gtk.Box(spacing=12)
+            b.append(Gtk.Image(icon_name=icon))
+            b.append(Gtk.Label(label=title, xalign=0))
+            row.set_child(b)
+            return row
+
+        def _page(self, title, subtitle, *extra):
+            """A scrolled page with a big title; returns (page, body)."""
+            body = Gtk.Box(orientation=V, spacing=22, margin_top=8, margin_bottom=28,
+                           margin_start=28, margin_end=28)
+            head = Gtk.Box(spacing=16)
+            names = Gtk.Box(orientation=V, spacing=4, hexpand=True, valign=CENTER)
+            names.append(label(title, "ms-h1"))
+            self.page_sub = label(subtitle, "ms-dim", wrap=True)
+            names.append(self.page_sub)
+            head.append(names)
+            for w in extra:
+                head.append(w)
+            body.append(head)
+            return Gtk.ScrolledWindow(child=body, hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True), body
+
+        def _columns(self, *children, homogeneous=False):
+            """Side by side when wide, stacked when narrow."""
+            box = Gtk.Box(spacing=16, homogeneous=homogeneous)
+            for c in children:
+                box.append(c)
+            self.narrow.append((box, "orientation", V))
+            return box
+
+        # ---- overview
+
+        def _overview(self):
+            self.health = label("", "ms-pill", valign=CENTER)
+            when = Gtk.Box(orientation=V, valign=CENTER)
+            when.append(label("Last updated", "ms-dim", "ms-small", xalign=1))
+            self.updated = label("–", "ms-num", xalign=1)
+            when.append(self.updated)
+            refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh now", valign=CENTER)
+            refresh.add_css_class("circular")
+            refresh.connect("clicked", lambda *_: self.refresh(files=True))
+            page, body = self._page("System Overview",
+                                    "Live memory use, and suggestions to keep your system running smoothly.",
+                                    self.health, when, refresh)
+
+            cards = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+                                min_children_per_line=1, max_children_per_line=4,
+                                column_spacing=16, row_spacing=16)
+            cards.add_css_class("ms-flow")
+            self.narrow.append((cards, "max-children-per-line", 2))  # 2 + 2 rather than 3 + 1
+            self.ram_card = StatCard("RAM", "ms-ram-symbolic", "blue", ("Used", "Available", "Total"))
+            self.swap_card = StatCard("Swap", "ms-swap-symbolic", "purple", ("Used", "Free", "Total"),
+                                      on_click=lambda: self.show_page("memory"))
+            self.zram_card = StatCard("zram", "ms-zram-symbolic", "green", ("Used", "In RAM", "Size"),
+                                      on_click=lambda: self.show_page("memory"))
+            self.files_card = StatCard("Files held in RAM", "folder-symbolic", "orange",
+                                       ("Used", "Free", "Size"), on_click=lambda: self.show_page("files"))
+            for c in (self.ram_card, self.swap_card, self.zram_card, self.files_card):
+                cards.append(c)
+            body.append(cards)
+
+            tips = Gtk.Box(orientation=V, spacing=12)
+            head = Gtk.Box(spacing=10)
+            head.append(label("Suggestions", "ms-h2", valign=CENTER))
+            self.tips_count = label("", "ms-pill", "blue", valign=CENTER)
+            head.append(self.tips_count)
+            head.append(Gtk.Box(hexpand=True))
+            self.see_all = link("See all", self._toggle_tips)
+            head.append(self.see_all)
+            tips.append(head)
+            self.tips_box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+                                        min_children_per_line=1, max_children_per_line=3,
+                                        column_spacing=16, row_spacing=16)
+            self.tips_box.add_css_class("ms-flow")
+            tips.append(self.tips_box)
+            body.append(tips)
+
+            apps = card(spacing=10, hexpand=True)
+            head = Gtk.Box()
+            head.append(label("Biggest apps", "ms-h2", hexpand=True, valign=CENTER))
+            head.append(link("View all", lambda: self.show_page("apps")))
+            apps.append(head)
+            cols = Gtk.Box(spacing=12, margin_start=6, margin_end=6)
+            cols.append(label("App", "ms-head", hexpand=True))
+            cols.append(label("Processes", "ms-head", xalign=1, width_request=72))
+            cols.append(label("Memory", "ms-head", width_request=220))
+            apps.append(cols)
+            self.top_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            self.top_list.add_css_class("ms-list")
+            self.top_list.connect("row-activated", lambda _l, r: self._review("apps", r.key))
+            apps.append(self.top_list)
+
+            chart = card(spacing=10, hexpand=True)
+            head = Gtk.Box(spacing=8)
+            head.append(label("Memory Usage Chart", "ms-h2", hexpand=True, valign=CENTER))
+            self.span = Gtk.DropDown.new_from_strings([t for _, t in CHART_SPANS])
+            self.span.set_valign(CENTER)
+            self.span.connect("notify::selected", lambda *_: self.chart.queue_draw())
+            head.append(self.span)
+            chart.append(head)
+            self.chart = Chart(self._draw_chart)
+            chart.append(self.chart)
+            legend = Gtk.Box(spacing=18, halign=CENTER)
+            self.legend = {}
+            for key, name, color in (("ram", "RAM", "blue"), ("swap", "Swap", "purple"),
+                                     ("zram", "zram", "green")):
+                item = Gtk.Box(spacing=6)
+                dot = Gtk.Box(valign=CENTER)
+                dot.add_css_class("ms-dot")
+                dot.add_css_class(color)
+                item.append(dot)
+                self.legend[key] = label(name, "ms-dim", "ms-small")
+                item.append(self.legend[key])
+                legend.append(item)
+            chart.append(legend)
+            body.append(self._columns(apps, chart, homogeneous=True))
+            return page
+
+        def _apply_overview(self, snap):
+            pct = 100 * snap.used / snap.total if snap.total else 0
+            if pct >= 90:
+                pill(self.health, "red", "● Almost full")
+            elif pct >= 75:
+                pill(self.health, "orange", "● Busy")
+            else:
+                pill(self.health, "green", "● Healthy")
+            self.updated.set_label(time.strftime("%H:%M:%S", time.localtime(snap.time)))
+            self.ram_card.update(f"{pct:.0f}%", pct / 100,
+                                 f"{fmt_size(snap.used)} of {fmt_size(snap.total)} in use",
+                                 (fmt_size(snap.used), fmt_size(snap.available), fmt_size(snap.total)))
+            size, used = snap.swap_parts(zram=False)
+            if size:
+                devs = [os.path.basename(d) for d, _, _, _ in snap.swaps if "/zram" not in d]
+                self.swap_card.update(f"{100 * used / size:.0f}%", used / size, ", ".join(devs),
+                                      (fmt_size(used), fmt_size(size - used), fmt_size(size)))
+            else:
+                self.swap_card.update("Off", 0, "No swap file or partition", ("–", "–", "–"))
+            size, used = snap.swap_parts(zram=True)
+            stored = sum(s for _, s, _ in snap.zram)
+            in_ram = sum(r for _, _, r in snap.zram)
+            if size:
+                ratio = f"{stored / in_ram:.1f}× compression" if in_ram else "Compressed swap in RAM"
+                self.zram_card.update(f"{100 * used / size:.0f}%", used / size, ratio,
+                                      (fmt_size(used), fmt_size(in_ram), fmt_size(size)))
+            else:
+                self.zram_card.update("Off", 0, "Turn it on in Settings", ("–", "–", "–"))
+            used = sum(u for _, u, _ in snap.mounts)
+            size = sum(t for _, _, t in snap.mounts)
+            self.files_card.update(f"{100 * used / size:.0f}%" if size else "–", used / size if size else 0,
+                                   " and ".join(mp for mp, _, _ in snap.mounts) or "No RAM folders",
+                                   (fmt_size(used), fmt_size(size - used), fmt_size(size)))
+            self._show_tips(snap)
+            self._show_top(snap)
+
+        def _toggle_tips(self):
+            self.all_tips = not self.all_tips
+            self.tips_shown = None
+            self._show_tips(self.snap)
+
+        def _show_tips(self, snap):
+            tips = snap.tips()
+            shown = tips if self.all_tips else tips[:3]
+            self.tips_count.set_label(str(len(tips)))
+            self.tips_count.set_visible(bool(tips))
+            self.see_all.set_visible(len(tips) > 3)
+            self.see_all.set_label("Show less" if self.all_tips else "See all")
+            if shown == self.tips_shown:
+                return
+            self.tips_shown = shown
+            self.tips_box.remove_all()
+            for kind, text, page, key in shown:
+                self.tips_box.append(self._tip_card(snap, kind, text, page, key))
+            if not tips:
+                c = card(spacing=12, vertical=False)
+                c.append(badge("object-select-symbolic", "green", small=True))
+                texts = Gtk.Box(orientation=V, valign=CENTER)
+                texts.append(label("Nothing stands out right now", "ms-strong"))
+                texts.append(label("Memory use looks healthy.", "ms-dim", "ms-small"))
+                c.append(texts)
+                self.tips_box.append(c)
+
+        def _tip_card(self, snap, kind, text, page, key):
+            color, icon = {"files": ("orange", "folder-symbolic"), "end": ("red", "process-stop-symbolic"),
+                           "zram": ("green", "ms-zram-symbolic")}.get(
+                kind, ("blue", "preferences-desktop-apps-symbolic"))
+            c = card(spacing=12, vertical=False)
+            c.append(badge(icon, color, small=True))
+            c.append(label(text, wrap=True, hexpand=True, valign=CENTER))
+            if kind == "end":
+                grp = next(g for g in snap.groups if g.key == key)
+                b = Gtk.Button(label="End", valign=CENTER)
+                b.add_css_class("destructive-action")
+                b.connect("clicked", lambda *_: self.confirm_end(grp, grp.instances))
+            else:
+                b = Gtk.Button(label="Set up" if kind == "zram" else "Review", valign=CENTER)
+                b.connect("clicked", lambda *_: self._review(page, key))
+            c.append(b)
+            return c
+
+        def _show_top(self, snap):
+            self.top_list.remove_all()
+            groups = snap.groups[:6]
+            biggest = groups[0].mem if groups and groups[0].mem else 1
+            for g in groups:
+                row = Gtk.ListBoxRow(activatable=True)
+                row.key = g.key
+                b = Gtk.Box(spacing=12)
+                gicon = self.icons.get(g.key)
+                img = Gtk.Image.new_from_gicon(gicon) if gicon else \
+                    Gtk.Image(icon_name="application-x-executable-symbolic")
+                img.set_pixel_size(24)
+                b.append(img)
+                b.append(label(g.title, hexpand=True, ellipsize=Pango.EllipsizeMode.END))
+                b.append(label(str(len(g.procs)), "ms-num", "ms-dim", xalign=1, width_request=72))
+                mem = Gtk.Box(spacing=10, width_request=220, hexpand=False)
+                pb = bar("blue", thin=True)
+                pb.set_hexpand(True)
+                pb.set_fraction(g.mem / biggest)
+                mem.append(pb)
+                mem.append(label(fmt_size(g.mem), "ms-num", xalign=1, width_chars=8))
+                b.append(mem)
+                row.set_child(b)
+                self.top_list.append(row)
+
+        def _sample(self):
+            ram, swap, comp = usage_sample()
+            self.history.append((time.monotonic(), ram, swap, comp))
+            for key, name, v in (("ram", "RAM", ram), ("swap", "Swap", swap), ("zram", "zram", comp)):
+                self.legend[key].set_label(f"{name} {v:.0f}%")
+            self.chart.queue_draw()
+            return True
+
+        def _draw_chart(self, chart, snap, w, h):
+            pal = self.app.palette
+            span = CHART_SPANS[self.span.get_selected()][0]
+            left, right, top, bottom = 42, 10, 8, 24
+            pw, ph = w - left - right, h - top - bottom
+            if pw <= 0 or ph <= 0:
+                return
+            font = Pango.FontDescription.from_string("Sans 8")
+            dim = rgba(pal["dim"])
+
+            def text(t, x, y, align=0.0):
+                layout = chart.create_pango_layout(t)
+                layout.set_font_description(font)
+                tw, th = layout.get_pixel_size()
+                snap.save()
+                snap.translate(Graphene.Point().init(x - tw * align, y - th / 2))
+                snap.append_layout(layout, dim)
+                snap.restore()
+
+            for pct in (0, 25, 50, 75, 100):
+                y = round(top + ph * (1 - pct / 100))
+                snap.append_color(rgba(pal["border"]), Graphene.Rect().init(left, y, pw, 1))
+                text(f"{pct}%", left - 8, y, align=1)
+            ago = (lambda s: f"{s} s ago") if span < 120 else (lambda s: f"{s // 60} min ago")
+            for frac, t, align in ((0, ago(span), 0), (0.5, ago(span // 2), 0.5), (1, "now", 1)):
+                text(t, left + pw * frac, h - 8, align)
+            now = time.monotonic()
+            pts = [p for p in self.history if now - p[0] <= span + SAMPLE_SECONDS]
+            if len(pts) < 2:
+                return
+
+            def xy(t, v):
+                return left + pw * max(0, 1 - (now - t) / span), top + ph * (1 - min(100, v) / 100)
+
+            stroke = Gsk.Stroke.new(2.2)
+            stroke.set_line_join(Gsk.LineJoin.ROUND)
+            for idx, color in ((3, COLORS["green"]), (2, COLORS["purple"]), (1, COLORS["blue"])):
+                line = Gsk.PathBuilder.new()
+                for i, p in enumerate(pts):
+                    (line.move_to if i == 0 else line.line_to)(*xy(p[0], p[idx]))
+                if idx == 1:  # soft fill under the RAM line
+                    area = Gsk.PathBuilder.new()
+                    for i, p in enumerate(pts):
+                        (area.move_to if i == 0 else area.line_to)(*xy(p[0], p[idx]))
+                    area.line_to(xy(pts[-1][0], 0)[0], top + ph)
+                    area.line_to(xy(pts[0][0], 0)[0], top + ph)
+                    area.close()
+                    snap.append_fill(area.to_path(), Gsk.FillRule.WINDING, rgba(color, 0.16))
+                snap.append_stroke(line.to_path(), stroke, rgba(color))
+
+        def _review(self, page, key):
+            self.show_page(page)
+            if key and key in self.group_rows:
+                row = self.group_rows[key]
+                self.search.set_text("")
+                row.set_expanded(True)
+                GLib.idle_add(lambda: row.grab_focus() and False)
+
+        # ---- pages and navigation
+
+        def show_page(self, name):
+            sub = None
+            if name in [n for n, _, _ in SETTING_PAGES]:
+                sub, name = name, "settings"
+            if name not in self.nav_rows:
+                name = "overview"
+            self.stack.set_visible_child_name(name)
+            self.syncing = True
+            try:
+                self.nav.select_row(self.nav_rows[name])
+                if name in TABS:
+                    self.tabs.set_active_name(name)
+                    self.header.set_title_widget(self.tabs)
+                else:
+                    self.header_title.set_title(dict((n, t) for n, t, _ in PAGES)[name])
+                    self.header.set_title_widget(self.header_title)
+            finally:
+                self.syncing = False
+            if name == "settings":
+                self.show_setting(sub or self.set_stack.get_visible_child_name() or "memory")
+            if name == "files" and not self.files_loaded:
+                self.open_folder(self.folder)
+            if self.split.get_collapsed():
+                self.split.set_show_sidebar(False)
+
+        # ---- scanning
+
+        def _restart_timer(self):
+            if self.timer:
+                GLib.source_remove(self.timer)
+            self.timer = GLib.timeout_add_seconds(self.settings["refresh"], self._tick)
+
+        def _tick(self):
+            if self.get_visible():
+                self.refresh()
+                if self.stack.get_visible_child_name() == "settings" and \
+                        self.set_stack.get_visible_child_name() == "memory" and not self.applying:
+                    self.status = swap_status()
+                    self._fill_status()
+            return True
+
+        def refresh(self, files=False):
+            if files and self.stack.get_visible_child_name() == "files":
+                self.open_folder(self.folder)
+            if self.scanning:
+                return
+            self.scanning = True
+
+            def work():
+                try:
+                    snap = Snapshot(keep)
+                except Exception as e:  # keep the timer alive on odd /proc races
+                    print("scan failed:", e, file=sys.stderr)
+                    snap = None
+                GLib.idle_add(self._apply, snap)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _apply(self, snap):
+            self.scanning = False
+            if snap is None:
+                return False
+            self.snap = snap
+            self._apply_overview(snap)
+            self._apply_apps(snap)
+            self._notify(snap)
+            return False
+
+        def _notify(self, snap):
+            pct = 100 * snap.used / snap.total if snap.total else 0
+            if not self.settings["notify"] or pct < self.settings["notify_at"] \
+                    or time.time() - self.last_notified < 600:
+                return
+            self.last_notified = time.time()
+            n = Gio.Notification.new("RAM is almost full")
+            body = f"{pct:.0f}% of RAM is in use."
+            if snap.groups:
+                body += f" {snap.groups[0].title} uses the most: {fmt_size(snap.groups[0].mem)}."
+            n.set_body(body)
+            n.set_default_action_and_target_value("app.show-page", GLib.Variant("s", "apps"))
+            self.app.send_notification("ram-high", n)
+
+        # ---- apps
+
+        def _apps(self):
+            self.search = Gtk.SearchEntry(placeholder_text="Search apps", valign=CENTER, width_request=260)
+            self.search.connect("search-changed", lambda *_: self.app_list.invalidate_filter())
+            page, body = self._page("Apps", "Everything running as you, grouped by app. "
+                                    "End what you do not need; unsaved work in it may be lost.",
+                                    self.search)
+            self.app_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            self.app_list.add_css_class("boxed-list")
+            self.app_list.set_sort_func(lambda a, b: (b.mem > a.mem) - (b.mem < a.mem))
+            self.app_list.set_filter_func(self._filter_app)
+            body.append(self.app_list)
+            self.hidden_label = label("", "dim-label", "caption")
+            body.append(self.hidden_label)
+            return page
+
+        def _filter_app(self, row):
+            q = self.search.get_text().strip().lower()
+            if q:
+                return q in row.search_text
+            return row.mem >= SMALL_GROUP
+
+        def _apply_apps(self, snap):
+            seen = set()
+            for g in snap.groups:
+                seen.add(g.key)
+                row = self.group_rows.get(g.key)
+                if row is None:
+                    row = Adw.ExpanderRow(use_markup=False)
+                    gicon = self.icons.get(g.key)
+                    img = Gtk.Image.new_from_gicon(gicon) if gicon else \
+                        Gtk.Image(icon_name="application-x-executable-symbolic")
+                    img.set_pixel_size(28)
+                    row.add_prefix(img)
+                    row.size = size_label()
+                    row.add_suffix(row.size)
+                    row.end_btn = end_button(lambda r=row: self.confirm_end(r.group, r.group.instances))
+                    row.add_suffix(row.end_btn)
+                    row.inst_rows = {}
+                    row.inst_order = []
+                    self.group_rows[g.key] = row
+                row.group = g
+                row.mem = g.mem
+                row.search_text = f"{g.title} {g.key}".lower()
+                if row.get_parent() is None:
+                    self.app_list.append(row)
+                row.set_title(g.title)
+                n, ni = len(g.procs), len(g.instances)
+                parts = [f"{n} process{'es' if n != 1 else ''}"]
+                if ni > 1:
+                    parts.append(f"{ni} instances")
+                if g.swap >= 10 << 20:
+                    parts.append(f"{fmt_size(g.swap)} in swap")
+                parts.append(g.locked or g.hint)
+                row.set_subtitle(" · ".join(p for p in parts if p))
+                row.size.set_label(fmt_size(g.mem))
+                busy = all(i.id in self.busy for i in g.instances)
+                row.end_btn.set_visible(not g.locked)
+                row.end_btn.set_sensitive(not busy)
+                row.end_btn.set_label("Ending…" if busy else ("End all" if ni > 1 else "End"))
+                self._apply_instances(row, g)
+            for key in list(self.group_rows):
+                if key not in seen:
+                    self.app_list.remove(self.group_rows.pop(key))
+            self.app_list.invalidate_sort()
+            self.app_list.invalidate_filter()
+            small = sum(1 for g in snap.groups if g.mem < SMALL_GROUP)
+            self.hidden_label.set_label(f"{small} apps under {fmt_size(SMALL_GROUP)} are hidden; "
+                                        "search to find them" if small else "")
+
+        def _apply_instances(self, row, g):
+            order = [i.id for i in g.instances]
+            if order != row.inst_order:
+                for r in row.inst_rows.values():
+                    row.remove(r)
+                row.inst_rows = {}
+                for inst in g.instances:
+                    r = Adw.ActionRow(use_markup=False, subtitle_lines=1)
+                    r.size = size_label()
+                    r.add_suffix(r.size)
+                    r.end_btn = end_button(lambda r=r: self.confirm_end(row.group, [r.inst]))
+                    r.add_suffix(r.end_btn)
+                    row.add_row(r)
+                    row.inst_rows[inst.id] = r
+                row.inst_order = order
+            now = time.time()
+            for inst in g.instances:
+                r = row.inst_rows[inst.id]
+                r.inst = inst
+                n = len(inst.procs)
+                r.set_title(f"PID {inst.root.pid} · started {fmt_age(now - inst.root.start)} ago"
+                            + (f" · {n} processes" if n > 1 else ""))
+                cmd = " ".join(inst.root.argv) or inst.root.comm
+                r.set_subtitle(cmd if len(cmd) <= 140 else cmd[:139] + "…")
+                r.set_tooltip_text(cmd)
+                r.size.set_label(fmt_size(inst.mem))
+                locked = instance_locked(inst, keep)
+                busy = inst.id in self.busy
+                r.end_btn.set_visible(not locked)
+                r.end_btn.set_sensitive(not busy)
+                r.end_btn.set_label("Ending…" if busy else "End")
+
+        def confirm_end(self, group, instances):
+            instances = [i for i in instances if not instance_locked(i, keep) and i.id not in self.busy]
+            if not instances:
+                return
+            mem = sum(i.mem for i in instances)
+            procs = sum(len(i.tree) for i in instances)
+            whole = len(instances) == len(group.instances)
+            what = group.title if whole else f"{group.title} (PID {instances[0].root.pid})" \
+                if len(instances) == 1 else f"{len(instances)} instances of {group.title}"
+            dlg = Adw.AlertDialog(
+                heading=f"End {what}?",
+                body=f"{procs} process{'es' if procs != 1 else ''} using about {fmt_size(mem)} "
+                     "will be asked to quit. Unsaved work in them may be lost.")
+            dlg.add_response("cancel", "Cancel")
+            dlg.add_response("end", "End")
+            dlg.set_response_appearance("end", Adw.ResponseAppearance.DESTRUCTIVE)
+            dlg.set_default_response("cancel")
+            dlg.set_close_response("cancel")
+            dlg.connect("response", lambda d, r: r == "end" and self.end(what, instances, mem))
+            dlg.present(self)
+
+        def end(self, what, instances, mem, force=False):
+            for i in instances:
+                self.busy.add(i.id)
+            if self.snap:
+                self._apply_apps(self.snap)
+
+            def work():
+                left = stop(instances, force=force, keep=keep)
+                GLib.idle_add(done, left)
+
+            def done(left):
+                for i in instances:
+                    self.busy.discard(i.id)
+                if left:
+                    t = Adw.Toast(title=f"{what} is still running ({len(left)} processes)", timeout=10)
+                    t.set_button_label("Force quit")
+                    t.connect("button-clicked", lambda *_: self.end(what, instances, mem, force=True))
+                else:
+                    t = Adw.Toast(title=f"Ended {what}, about {fmt_size(mem)} freed")
+                self.toasts.add_toast(t)
+                self.refresh()
+                return False
+
+            threading.Thread(target=work, daemon=True).start()
+
+        # ---- files
+
+        def _files(self):
+            page, body = self._page("Files in RAM", "Files in /tmp and /dev/shm live in RAM. "
+                                    "Removing the ones you no longer need frees that memory at once.")
+            bar_ = Gtk.Box(spacing=8)
+            self.up_btn = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Up one folder")
+            self.up_btn.connect("clicked", lambda *_: self.open_folder(self._parent(self.folder)))
+            bar_.append(self.up_btn)
+            self.folder_label = label("", "heading", hexpand=True, ellipsize=Pango.EllipsizeMode.START,
+                                      selectable=True)
+            bar_.append(self.folder_label)
+            self.files_spinner = Adw.Spinner(visible=False)
+            bar_.append(self.files_spinner)
+            body.append(bar_)
+            self.files_info = label("", "dim-label", wrap=True)
+            body.append(self.files_info)
+            self.file_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            self.file_list.add_css_class("boxed-list")
+            body.append(self.file_list)
+            self.files_hidden = label("", "dim-label", "caption")
+            body.append(self.files_hidden)
+            return page
+
+        @staticmethod
+        def _parent(folder):
+            if not folder or folder in FILE_ROOTS:
+                return None
+            return os.path.dirname(folder)
+
+        def open_folder(self, folder):
+            self.folder = folder
+            self.files_loaded = True
+            self.folder_label.set_label(folder or "All RAM folders: " + ", ".join(FILE_ROOTS))
+            self.up_btn.set_sensitive(folder is not None)
+            self.files_spinner.set_visible(True)
+
+            def work():
+                try:
+                    items = list_items(folder)
+                except OSError:
+                    items = []
+                GLib.idle_add(show, items)
+
+            def show(items):
+                if self.folder != folder:
+                    return False
+                self.files_spinner.set_visible(False)
+                self._show_items(folder, items)
+                return False
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _show_items(self, folder, items):
+            self.file_list.remove_all()
+            total = sum(i.size for i in items)
+            if folder:
+                self.files_info.set_label(f"{fmt_size(total)} in {len(items)} items")
+            else:
+                mine = sum(i.size for i in items if i.own)
+                text = (f"Files here live in RAM, or in swap when RAM runs out. {fmt_size(total)} in total, "
+                        f"{fmt_size(mine)} of it yours. Removing them frees that memory right away.")
+                for mp, n in hidden_usage(items, ram_mounts()).items():
+                    text += (f"\n{fmt_size(n)} of {mp} is not visible as files: running apps keep it "
+                             "open (browsers do this) and free it when they quit.")
+                self.files_info.set_label(text)
+            shown = [i for i in items if folder or i.size >= SMALL_ITEM][:300]
+            now = time.time()
+            for it in shown:
+                row = Adw.ActionRow(title=it.name, use_markup=False, subtitle_lines=2)
+                row.add_prefix(Gtk.Image(icon_name="folder-symbolic" if it.is_dir else "text-x-generic-symbolic"))
+                parts = []
+                if not folder:
+                    parts.append(os.path.dirname(it.path))
+                if it.note:
+                    parts.append(it.note)
+                if it.mtime:
+                    parts.append(f"changed {fmt_age(now - it.mtime)} ago")
+                if it.in_use:
+                    parts.append("in use")
+                if not it.own:
+                    parts.append("not yours")
+                row.set_subtitle(" · ".join(parts))
+                row.add_suffix(size_label(fmt_size(it.size)))
+                if it.own:
+                    b = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Remove", valign=CENTER)
+                    b.add_css_class("flat")
+                    b.connect("clicked", lambda *_, i=it: self.confirm_remove(i))
+                    row.add_suffix(b)
+                if it.is_dir:
+                    row.set_activatable(True)
+                    row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+                    row.connect("activated", lambda *_, p=it.path: self.open_folder(p))
+                self.file_list.append(row)
+            if not shown:
+                self.file_list.append(Adw.ActionRow(title="Empty", use_markup=False))
+            hidden = len(items) - len(shown)
+            self.files_hidden.set_label(f"{hidden} small items not shown" if hidden else "")
+
+        def confirm_remove(self, it):
+            why = removable(it.path)
+            if why:
+                self.toasts.add_toast(Adw.Toast(title=why))
+                return
+            body = f"{fmt_size(it.size)} at {it.path} will be deleted for good."
+            if it.in_use:
+                body += "\n\nA running program seems to use it. Removing it may break that program."
+            elif it.sockets:
+                body += f"\n\nIt holds {it.sockets} socket{'s' if it.sockets != 1 else ''}: " \
+                        "programs talk through these, and may stop working."
+            dlg = Adw.AlertDialog(heading=f"Remove {it.name}?", body=body)
+            dlg.add_response("cancel", "Cancel")
+            dlg.add_response("remove", "Remove")
+            dlg.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+            dlg.set_default_response("cancel")
+            dlg.set_close_response("cancel")
+            dlg.connect("response", lambda d, r: r == "remove" and self.remove(it))
+            dlg.present(self)
+
+        def remove(self, it):
+            self.files_spinner.set_visible(True)
+
+            def work():
+                try:
+                    left = remove(it.path)
+                    msg = f"Removed {it.name}, {fmt_size(it.size)} freed" if not left else \
+                        f"Removed most of {it.name}; {left} items could not be deleted"
+                except OSError as e:
+                    msg = f"Could not remove {it.name}: {e.strerror or e}"
+                GLib.idle_add(done, msg)
+
+            def done(msg):
+                self.toasts.add_toast(Adw.Toast(title=msg))
+                self.open_folder(self.folder)
+                self.refresh()
+                return False
+
+            threading.Thread(target=work, daemon=True).start()
+
+        # ---- settings
+
+        def _settings(self):
+            self.set_nav = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+            self.set_nav.add_css_class("ms-nav")
+            self.set_rows = {}
+            self.set_stack = Gtk.Stack(hexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+            builders = {"general": self._general, "appearance": self._appearance,
+                        "memory": self._memory, "notifications": self._notifications}
+            for name, title, icon in SETTING_PAGES:
+                row = self._nav_row(title, icon)
+                row.name = name
+                self.set_nav.append(row)
+                self.set_rows[name] = row
+                self.set_stack.add_named(builders[name](), name)
+            self.set_nav.connect("row-selected", lambda _l, r: r and not self.syncing and self.show_setting(r.name))
+            side = Gtk.Box(orientation=V, width_request=230, margin_top=8, margin_start=16, margin_end=12)
+            side.append(label("Settings", "ms-h2", margin_start=12, margin_bottom=10, margin_top=6))
+            side.append(self.set_nav)
+            box = Gtk.Box()
+            box.append(side)
+            line = Gtk.Separator(orientation=V)
+            line.add_css_class("ms-sep")
+            box.append(line)
+            box.append(self.set_stack)
+            self.narrow.append((box, "orientation", V))
+            self.narrow.append((line, "visible", False))
+            return box
+
+        def show_setting(self, name):
+            self.set_stack.set_visible_child_name(name)
+            self.syncing = True
+            try:
+                self.set_nav.select_row(self.set_rows[name])
+            finally:
+                self.syncing = False
+            if name == "memory" and not self.applying:
+                self._load_swap()
+
+        def _save(self, key, value):
+            self.settings[key] = value
+            try:
+                save_settings(self.settings)
+            except OSError as e:
+                self.toasts.add_toast(Adw.Toast(title=f"Could not save settings: {e.strerror or e}"))
+
+        def _general(self):
+            page, body = self._page("General", "How often Memory Sweep looks again, and where it opens.")
+            g = Adw.PreferencesGroup()
+            refresh = Adw.ComboRow(title="Refresh every", subtitle="Shorter uses a little more CPU",
+                                   model=Gtk.StringList.new([f"{s} seconds" for s in REFRESH_CHOICES]))
+            refresh.set_selected(REFRESH_CHOICES.index(self.settings["refresh"])
+                                 if self.settings["refresh"] in REFRESH_CHOICES else 1)
+            refresh.connect("notify::selected", lambda r, _: (
+                self._save("refresh", REFRESH_CHOICES[r.get_selected()]), self._restart_timer()))
+            g.add(refresh)
+            starts = [(n, t) for n, t, _ in PAGES if n in TABS]
+            start = Adw.ComboRow(title="Open on", model=Gtk.StringList.new([t for _, t in starts]))
+            names = [n for n, _ in starts]
+            start.set_selected(names.index(self.settings["start_page"])
+                               if self.settings["start_page"] in names else 0)
+            start.connect("notify::selected", lambda r, _: self._save("start_page", names[r.get_selected()]))
+            g.add(start)
+            body.append(g)
+            return page
+
+        def _appearance(self):
+            page, body = self._page("Appearance", "Pick a theme.")
+            g = Adw.PreferencesGroup()
+            row = Adw.ActionRow(title="Theme", subtitle="System follows the desktop's light or dark style")
+            themes = Adw.ToggleGroup(valign=CENTER)
+            for name, title in (("system", "System"), ("light", "Light"), ("dark", "Dark")):
+                themes.add(Adw.Toggle(name=name, label=title))
+            themes.set_active_name(self.settings["theme"])
+            themes.connect("notify::active-name", lambda t, _: (
+                self._save("theme", t.get_active_name()), self.app.apply_theme()))
+            row.add_suffix(themes)
+            g.add(row)
+            body.append(g)
+            return page
+
+        def _notifications(self):
+            page, body = self._page("Notifications", "Get a heads-up before RAM runs out.")
+            g = Adw.PreferencesGroup()
+            on = Adw.SwitchRow(title="Warn when RAM is almost full",
+                               subtitle="At most once every 10 minutes, while Memory Sweep is open",
+                               active=self.settings["notify"])
+            on.connect("notify::active", lambda r, _: self._save("notify", r.get_active()))
+            g.add(on)
+            at = Adw.SpinRow.new_with_range(70, 98, 1)
+            at.set_title("Warn at")
+            at.set_subtitle("Percent of RAM in use")
+            at.set_value(self.settings["notify_at"])
+            at.connect("notify::value", lambda r, _: self._save("notify_at", int(r.get_value())))
+            on.bind_property("active", at, "sensitive", GObject.BindingFlags.SYNC_CREATE)
+            g.add(at)
+            body.append(g)
+            return page
+
+        # ---- memory optimization
+
+        def _option(self, parent, title, subtitle, control, below=None, first=False):
+            """One setting in the Swap and zram card; returns its subtitle label."""
+            if not first:
+                parent.append(sep())
+            row = Gtk.Box(orientation=V, spacing=8, margin_top=14, margin_bottom=14)
+            top = Gtk.Box(spacing=16)
+            names = Gtk.Box(orientation=V, spacing=2, hexpand=True, valign=CENTER)
+            names.append(label(title, "ms-strong"))
+            sub = label(subtitle, "ms-dim", "ms-small", wrap=True)
+            names.append(sub)
+            top.append(names)
+            if control:
+                control.set_valign(CENTER)
+                top.append(control)
+            row.append(top)
+            if below:
+                row.append(below)
+            parent.append(row)
+            return sub
+
+        def _slider(self, lower, upper, step, page_step, marks):
+            adj = Gtk.Adjustment(lower=lower, upper=upper, step_increment=step, page_increment=page_step)
+            spin = Gtk.SpinButton(adjustment=adj, numeric=True, width_chars=4)
+            scale = Gtk.Scale(adjustment=adj, draw_value=False, hexpand=True, round_digits=0)
+            for value, text in marks:
+                scale.add_mark(value, Gtk.PositionType.BOTTOM, text)
+            adj.connect("value-changed", lambda *_: self._form_changed())
+            return adj, spin, scale
+
+        def _memory(self):
+            page, body = self._page("Memory Optimization",
+                                    "Set up zram, swap and zswap so your RAM goes further.")
+            banner = Gtk.Box(spacing=14)
+            banner.add_css_class("ms-banner")
+            banner.append(badge("dialog-information-symbolic", "blue", small=True))
+            texts = Gtk.Box(orientation=V, spacing=2, hexpand=True, valign=CENTER)
+            texts.append(label("About zram, swap and zswap", "ms-strong"))
+            texts.append(label("zram keeps swap in RAM, compressed, so it stays fast. A swap file on disk "
+                               "catches what does not fit. zswap compresses pages on their way to the swap "
+                               "file; next to zram it adds little.", "ms-dim", "ms-small", wrap=True))
+            banner.append(texts)
+            banner.append(link("Learn more", lambda: open_uri(self, ZRAM_DOCS)))
+            body.append(banner)
+
+            left = card(spacing=0, hexpand=True)
+            left.append(label("Swap and zram", "ms-h2", margin_bottom=4))
+            self.zram_adj, spin, scale = self._slider(
+                0, 150, 5, 25, ((0, "Off"), (50, "50%"), (100, "100%"), (150, "150%")))
+            self.zram_widgets = [spin, scale]
+            self.zram_sub = self._option(left, "zram size", "", spin, scale, first=True)
+            self.algo = Gtk.DropDown.new_from_strings(
+                ["lz4 (fastest)", "zstd (packs the most)", "lzo-rle (balanced)"])
+            self.algo.connect("notify::selected", lambda *_: self._form_changed())
+            self.zram_widgets.append(self.algo)
+            self._option(left, "Compression", "How zram packs pages. zstd fits the most in RAM; "
+                         "lz4 is the quickest.", self.algo)
+            self.file_adj, spin, scale = self._slider(
+                1, 64, 1, 4, ((1, "1"), (16, "16"), (32, "32"), (48, "48"), (64, "64 GB")))
+            self.file_sub = self._option(left, "Swap file (GB)", "", spin, scale)
+            self.zswap_sw = Gtk.Switch()
+            self.zswap_sw.connect("notify::active", lambda *_: self._form_changed())
+            self.zswap_sub = self._option(left, "zswap", "", self.zswap_sw)
+            tools = Gtk.Box(spacing=8, halign=Gtk.Align.START)
+            self.tools_state = label("", "ms-pill", valign=CENTER)
+            tools.append(self.tools_state)
+            self.tool_btns = {}
+            for action, text in (("install", "Install"), ("reinstall", "Reinstall"), ("remove", "Remove")):
+                b = Gtk.Button(label=text)
+                b.connect("clicked", lambda *_, a=action: self._pick_tools(a))
+                tools.append(b)
+                self.tool_btns[action] = b
+            self._option(left, "Install and remove tools",
+                         "zram-tools sets up zram at every start; zram needs it.", None, tools)
+            left.append(sep())
+            adv = Gtk.Expander(margin_top=14)
+            adv.set_label_widget(label("Advanced options", "ms-strong"))
+            adv_box = Gtk.Box(orientation=V)
+            self.swappiness_adj, spin, scale = self._slider(
+                0, 200, 5, 20, ((0, "0"), (60, "60"), (100, "100"), (200, "200")))
+            self._option(adv_box, "Swappiness", "How early the kernel moves idle pages to swap. "
+                         "60 is the usual default; 100 to 180 suits zram.", spin, scale, first=True)
+            self.cache_adj, spin, scale = self._slider(
+                1, 500, 10, 50, ((1, "1"), (100, "100"), (500, "500")))
+            self._option(adv_box, "Cache pressure", "How quickly the kernel drops cached file and "
+                         "folder names. 100 is the default.", spin, scale)
+            adv.set_child(adv_box)
+            left.append(adv)
+
+            right = Gtk.Box(orientation=V, spacing=16, width_request=340)
+            status = card(spacing=14)
+            status.append(label("Current status", "ms-h2"))
+            self.status_box = Gtk.Box(orientation=V, spacing=14)
+            status.append(self.status_box)
+            right.append(status)
+            actions = card(spacing=14)
+            actions.append(label("Actions", "ms-h2"))
+            warn = Gtk.Box(spacing=10)
+            warn.add_css_class("ms-warn")
+            warn.append(Gtk.Image(icon_name="dialog-warning-symbolic", valign=Gtk.Align.START))
+            warn.append(label("Changes need your administrator password. They apply at once and stay "
+                              "after a restart.", "ms-small", wrap=True, hexpand=True))
+            actions.append(warn)
+            self.pending_label = label("", "ms-dim", wrap=True)
+            actions.append(self.pending_label)
+            buttons = Gtk.Box(spacing=10)
+            reset = Gtk.Button(label="Reset to defaults", hexpand=True)
+            reset.connect("clicked", lambda *_: self._reset_form())
+            buttons.append(reset)
+            self.apply_btn = Gtk.Button(hexpand=True)
+            self.apply_btn.add_css_class("suggested-action")
+            inner = Gtk.Box(spacing=8, halign=CENTER)
+            self.apply_spinner = Adw.Spinner(visible=False)
+            inner.append(self.apply_spinner)
+            inner.append(Gtk.Label(label="Apply changes"))
+            self.apply_btn.set_child(inner)
+            self.apply_btn.connect("clicked", lambda *_: self._apply_swap())
+            buttons.append(self.apply_btn)
+            actions.append(buttons)
+            right.append(actions)
+            # The form needs more room than the other two-column parts, so it stacks sooner.
+            cols = Gtk.Box(spacing=16)
+            cols.append(left)
+            cols.append(right)
+            self.narrow_large.append((cols, "orientation", V))
+            body.append(cols)
+            return page
+
+        def _load_swap(self):
+            self.status = swap_status()
+            self.form = swap_form(self.status)
+            self._fill_form()
+            self._fill_status()
+
+        def _fill_form(self):
+            f = self.form
+            self.syncing = True
+            try:
+                self.zram_adj.set_value(f["zram"])
+                self.algo.set_selected(ALGOS.index(f["algo"]))
+                # No swap file yet: 0 keeps "no change" until the slider moves.
+                self.file_adj.set_lower(1 if f["file"] else 0)
+                self.file_adj.set_value(f["file"])
+                self.zswap_sw.set_active(f["zswap"])
+                self.swappiness_adj.set_value(f["swappiness"])
+                self.cache_adj.set_value(f["cache_pressure"])
+            finally:
+                self.syncing = False
+            self._update_pending()
+
+        def _form_changed(self):
+            if self.syncing or self.form is None:
+                return
+            self.form.update({
+                "zram": int(self.zram_adj.get_value()), "algo": ALGOS[self.algo.get_selected()],
+                "file": int(self.file_adj.get_value()), "zswap": self.zswap_sw.get_active(),
+                "swappiness": int(self.swappiness_adj.get_value()),
+                "cache_pressure": int(self.cache_adj.get_value())})
+            self._update_pending()
+
+        def _pick_tools(self, action):
+            self.form["tools"] = None if self.form["tools"] == action else action
+            self._update_pending()
+
+        def _reset_form(self):
+            if self.form is None:
+                return
+            tools = self.form["tools"]
+            self.form = dict(DEFAULTS, tools=tools)
+            if not self.status["file_size"]:
+                self.form["file"] = DEFAULTS["file"]
+            self._fill_form()
+
+        def _update_pending(self):
+            st, f = self.status, self.form
+            self.pending = plan_changes(st, f)
+            if self.pending:
+                self.pending_label.set_label("Waiting to apply:\n" + "\n".join(
+                    "•  " + describe_change(a) for a in self.pending))
+            else:
+                self.pending_label.set_label("No changes yet. Change a setting, then apply it here.")
+            self.apply_btn.set_sensitive(bool(self.pending) and not self.applying)
+            installed = st["tools"]
+            pill(self.tools_state, "green" if installed else "dim",
+                 "zram-tools installed" if installed else "zram-tools not installed")
+            self.tool_btns["install"].set_visible(not installed)
+            self.tool_btns["reinstall"].set_visible(installed)
+            self.tool_btns["remove"].set_visible(installed)
+            for action, b in self.tool_btns.items():
+                chosen = f["tools"] == action
+                b.set_css_classes((["destructive-action"] if action == "remove" else ["suggested-action"])
+                                  if chosen else [])
+            usable = (installed or f["tools"] in ("install", "reinstall")) and f["tools"] != "remove"
+            for w in self.zram_widgets:
+                w.set_sensitive(usable)
+            pct = f["zram"]
+            ram = st["ram"]
+            self.zram_sub.set_label(
+                "Install zram-tools first" if not usable else
+                "Off. Swap goes straight to disk." if pct == 0 else
+                f"Up to {fmt_size(ram * pct // 100)} of swapped memory kept compressed in RAM. "
+                "0 turns zram off.")
+            if st["file"]:
+                where = f"{st['file']}, {fmt_size(st['file_size'])} now" if st["file_size"] else st["file"]
+            else:
+                where = "No swap file yet; one is made at /swap.img"
+            self.file_sub.set_label(f"{where} · {fmt_size(st['disk_free'])} free on disk")
+            self.zswap_sw.set_sensitive(st["zswap"] is not None)
+            self.zswap_sub.set_label(
+                "This kernel has no zswap" if st["zswap"] is None else
+                "Compresses pages before they reach the swap file. With zram on it adds little."
+                if pct else "Compresses pages in RAM before they reach the swap file.")
+
+        def _fill_status(self):
+            st = self.status
+            box = self.status_box
+            while (child := box.get_first_child()):
+                box.remove(child)
+
+            def line(title, value, color=None, frac=None, note=None):
+                item = Gtk.Box(orientation=V, spacing=6)
+                top = Gtk.Box()
+                top.append(label(title, "ms-strong", hexpand=True))
+                v = label(value, "ms-num", xalign=1)
+                if color and frac is None:
+                    v.set_css_classes(["ms-pill", color])
+                top.append(v)
+                item.append(top)
+                if frac is not None:
+                    pb = bar(color, thin=True)
+                    pb.set_fraction(max(0, min(1, frac)))
+                    item.append(pb)
+                if note:
+                    item.append(label(note, "ms-dim", "ms-small", wrap=True))
+                box.append(item)
+
+            if st["zram_on"]:
+                ratio = f", {st['zram_stored'] / st['zram_ram']:.1f}× packed" if st["zram_ram"] else ""
+                line("zram", f"{fmt_size(st['zram_size'])} · {st['algo']}", "green",
+                     st["zram_used"] / st["zram_size"] if st["zram_size"] else 0,
+                     f"{fmt_size(st['zram_used'])} used{ratio}")
+            else:
+                line("zram", "Off", "dim")
+            if st["file_active"]:
+                line("Swap file", fmt_size(st["file_size"]), "purple",
+                     st["file_used"] / st["file_size"] if st["file_size"] else 0,
+                     f"{st['file']} · {fmt_size(st['file_used'])} used")
+            else:
+                line("Swap file", "Off", "dim", note=st["file"])
+            if st["zswap"] is None:
+                line("zswap", "Not in kernel", "dim")
+            else:
+                line("zswap", f"On · {st['zswap_compressor']}" if st["zswap"] else "Off",
+                     "green" if st["zswap"] else "dim")
+            line("Swappiness", str(st["swappiness"]))
+            line("Cache pressure", str(st["cache_pressure"]))
+
+        def _apply_swap(self):
+            args = list(self.pending)
+            if not args or self.applying:
+                return
+            try:
+                proc = Gio.Subprocess.new(swap_command(args), Gio.SubprocessFlags.STDOUT_PIPE
+                                          | Gio.SubprocessFlags.STDERR_PIPE)
+            except GLib.Error as e:
+                self.toasts.add_toast(Adw.Toast(title=e.message))
+                return
+            self.applying = True
+            self.apply_spinner.set_visible(True)
+            self.apply_btn.set_sensitive(False)
+            proc.communicate_utf8_async(None, None, self._swap_done, args)
+
+        def _swap_done(self, proc, res, args):
+            try:
+                _, out, _ = proc.communicate_utf8_finish(res)
+            except GLib.Error:
+                out = ""
+            code = proc.get_exit_status()
+            done = [w.split()[1] for w in (out or "").splitlines() if w.startswith("ok ")]
+            if code == 0:
+                msg = "Changes applied"
+            elif code in (126, 127):  # pkexec: no password given
+                msg = "Cancelled"
+            else:
+                msg = SWAP_ERRORS.get(code, f"The change failed (code {code})")
+                if done:
+                    msg += f". Done before that: {', '.join(done)}"
+            self.applying = False
+            self.apply_spinner.set_visible(False)
+            self.toasts.add_toast(Adw.Toast(title=msg, timeout=6))
+            self._load_swap()
+            self.refresh()
+
+        # ---- about
+
+        def _about(self):
+            page, body = self._page("About", "Who made Memory Sweep, and how.")
+            hero = card(spacing=16, vertical=False)
+            hero.append(Gtk.Image(icon_name=APP_ID, pixel_size=96))
+            texts = Gtk.Box(orientation=V, spacing=4, valign=CENTER, hexpand=True)
+            texts.append(label(APP_NAME, "ms-h1"))
+            texts.append(label(f"Version {VERSION}", "ms-dim"))
+            texts.append(label("See what fills your RAM, then end it or remove it. Set up zram, swap "
+                               "and zswap so your RAM goes further.", wrap=True))
+            texts.append(label(f"Developed by {AUTHOR}", "ms-dim", "ms-small"))
+            hero.append(texts)
+            more = Gtk.Button(label="Credits and license", valign=CENTER)
+            more.connect("clicked", lambda *_: self.app.activate_action("about", None))
+            hero.append(more)
+            body.append(hero)
+            safety = card(spacing=8)
+            safety.append(label("What it never touches", "ms-h2"))
+            safety.append(label(
+                "It ends only your own processes, never the parts of the desktop session, and checks "
+                "each process again just before it signals it. It removes only your own files in /tmp "
+                "and /dev/shm. Swap changes run through a small helper that asks for your password and "
+                "changes nothing else.", "ms-dim", wrap=True))
+            body.append(safety)
+            ai = card(spacing=8)
+            ai.append(label("AI statement", "ms-h2"))
+            ai.append(label(AI_STATEMENT, "ms-dim", wrap=True))
+            body.append(ai)
+            return page
+
+    class App(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+            self.settings = load_settings()
+            self.palette = PALETTES["dark"]
+            self.css = None
+            about = Gio.SimpleAction.new("about", None)
+            about.connect("activate", self._about)
+            self.add_action(about)
+            show = Gio.SimpleAction.new("show-page", GLib.VariantType.new("s"))
+            show.connect("activate", lambda a, v: self._present(v.get_string()))
+            self.add_action(show)
+
+        def do_startup(self):
+            Adw.Application.do_startup(self)
+            icons = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+            here = os.path.dirname(os.path.realpath(__file__))
+            for d in (os.path.join(here, "..", "data", "icons"), "/usr/share/memory-sweep/icons"):
+                if os.path.isdir(d):
+                    icons.add_search_path(d)
+            Adw.StyleManager.get_default().connect("notify::dark", lambda *_: self._load_palette())
+            self.apply_theme()
+            self.set_accels_for_action("window.close", ["<Control>w", "<Control>q"])
+
+        def apply_theme(self):
+            scheme = {"dark": Adw.ColorScheme.FORCE_DARK, "light": Adw.ColorScheme.FORCE_LIGHT}
+            Adw.StyleManager.get_default().set_color_scheme(
+                scheme.get(self.settings["theme"], Adw.ColorScheme.DEFAULT))
+            self._load_palette()
+
+        def _load_palette(self):
+            display = Gdk.Display.get_default()
+            self.palette = PALETTES["dark" if Adw.StyleManager.get_default().get_dark() else "light"]
+            if self.css:
+                Gtk.StyleContext.remove_provider_for_display(display, self.css)
+            self.css = Gtk.CssProvider()
+            self.css.load_from_string(CSS.substitute(self.palette))
+            Gtk.StyleContext.add_provider_for_display(display, self.css,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            win = self.get_active_window()
+            if win:
+                win.chart.queue_draw()
+
+        def do_command_line(self, cmdline):
+            args = cmdline.get_arguments()[1:]
+            self._present(args[args.index("--page") + 1] if "--page" in args[:-1] else None)
+            return 0
+
+        def _present(self, want):
+            win = self.get_active_window()
+            if win is None:
+                win = Window(self)
+            elif want:
+                win.show_page(want)
+            if want:
+                win.show_page(want)
+            win.present()
+
+        def _about(self, *_):
+            about = Adw.AboutDialog(
+                application_name=APP_NAME, application_icon=APP_ID, version=VERSION,
+                developer_name=AUTHOR, developers=[AUTHOR], copyright=f"© 2026 {AUTHOR}",
+                license_type=Gtk.License.MIT_X11,
+                comments=f"See what fills your RAM, then end it or remove it.\n\nDeveloped by {AUTHOR}.")
+            about.add_legal_section("AI statement", None, Gtk.License.CUSTOM, AI_STATEMENT)
+            about.present(self.get_active_window())
+
+    return App().run([sys.argv[0]] + (["--page", page] if page else []))
+
+
+def main(argv):
+    if argv[:1] == ["report"]:
+        report(as_json="--json" in argv)
+        return 0
+    if argv[:1] == ["end"] and len(argv) >= 2:
+        return end_app(argv[1], force="--force" in argv)
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv[:1] == ["--version"]:
+        print(VERSION)
+        return 0
+    page = argv[argv.index("--page") + 1] if "--page" in argv[:-1] else None
+    return run_gui(page)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

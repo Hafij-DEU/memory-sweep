@@ -1,0 +1,191 @@
+#!/bin/sh
+# Memory Sweep swap helper, run as root through pkexec. It changes only zram,
+# the swap file, zswap, two vm settings and the zram-tools package. Each
+# argument is one change; they run in the order below whatever order they
+# are given in, so one password prompt covers them all:
+#   tools=install|reinstall   install zram-tools (first, so zram= can follow)
+#   zram=<percent of RAM 0..150>:<lz4|zstd|lzo-rle>   (0 = zram off)
+#   file=<GB 1..64>           resize the swap file
+#   zswap=1|0
+#   swappiness=<0..200>
+#   cache_pressure=<1..500>   vm.vfs_cache_pressure
+#   tools=remove              purge zram-tools (last)
+# Exit codes: 2 bad arguments, 3 not enough free disk space, 4 not enough
+# free memory to take back what is swapped out, 5 file system without
+# fallocate swap files (btrfs), 6 zram-tools is not installed, 7 the kernel
+# has no zswap, 8 apt-get failed. Each change that worked prints "ok <key>".
+set -eu
+
+CONF=/etc/default/zramswap
+ZSWAP=/sys/module/zswap/parameters
+# Keeps zswap on after a restart (systemd-tmpfiles writes it early at boot);
+# zswap off deletes it, so the kernel's own default comes back.
+ZSWAP_BOOT=/etc/tmpfiles.d/memory-sweep-zswap.conf
+SYSCTL=/etc/sysctl.d/90-memory-sweep.conf
+# Kept free: RAM while a swap device turns off, disk after the swap file grows (KiB).
+RAM_MARGIN=524288
+DISK_MARGIN=2097152
+
+number() {
+    case "${1:-}" in
+    ''|*[!0-9]*) exit 2 ;;
+    esac
+}
+
+meminfo() {
+    awk -v k="$1:" '$1 == k {print $2}' /proc/meminfo
+}
+
+# Turning swap devices off moves what they hold back into RAM or onto the
+# other swap devices; refuse when that would not fit.
+fits_without() { # awk test picking the devices that turn off
+    awk -v avail="$(meminfo MemAvailable)" -v margin="$RAM_MARGIN" "
+        NR > 1 && ($1) { used += \$4; next }
+        NR > 1 { free += \$3 - \$4 }
+        END { exit !(used + margin < avail + free) }" /proc/swaps
+}
+
+# Set KEY=VALUE in the zram config, replacing the active line or adding one.
+set_conf() {
+    if grep -q "^$1=" "$CONF"; then
+        sed -i "s/^$1=.*/$1=$2/" "$CONF"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$CONF"
+    fi
+}
+
+apt() {
+    DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get -y -q "$@" > /dev/null || exit 8
+}
+
+do_tools() {
+    case "$1" in
+    install) apt install zram-tools ;;
+    reinstall) apt install --reinstall zram-tools ;;
+    remove)
+        if [ -f "$CONF" ] && grep -q '^/dev/zram' /proc/swaps; then
+            fits_without '$1 ~ /^\/dev\/zram/' || exit 4
+        fi
+        apt purge zram-tools
+        ;;
+    *) exit 2 ;;
+    esac
+}
+
+do_zram() {
+    percent=${1%%:*}
+    algo=${1#*:}
+    number "$percent"
+    [ "$percent" -le 150 ] || exit 2
+    case "$algo" in
+    lz4|zstd|lzo-rle) ;;
+    *) exit 2 ;;
+    esac
+    [ -f "$CONF" ] && [ -x /usr/sbin/zramswap ] || exit 6
+    fits_without '$1 ~ /^\/dev\/zram/' || exit 4
+    set_conf PERCENT "$percent"
+    set_conf ALGO "$algo"
+    if [ "$percent" -eq 0 ]; then
+        systemctl disable --now zramswap.service
+    else
+        systemctl enable zramswap.service
+        systemctl restart zramswap.service
+    fi
+}
+
+do_file() {
+    number "$1"
+    [ "$1" -ge 1 ] && [ "$1" -le 64 ] || exit 2
+    # The active swap file, else the one in fstab, else Ubuntu's default.
+    path=$(awk 'NR > 1 && $2 == "file" {print $1; exit}' /proc/swaps)
+    [ -n "$path" ] || path=$(awk '$3 == "swap" && $1 ~ /^\// && $1 !~ /^\/dev\// {print $1; exit}' /etc/fstab)
+    [ -n "$path" ] || path=/swap.img
+    dir=$(dirname "$path")
+    [ "$(stat -f -c %T "$dir")" != btrfs ] || exit 5
+    want=$(($1 * 1048576))
+    have=0
+    [ -f "$path" ] && have=$(($(stat -c %s "$path") / 1024))
+    free=$(df -Pk "$dir" | awk 'NR == 2 {print $4}')
+    [ $((free + have - want)) -ge "$DISK_MARGIN" ] || exit 3
+    active=$(awk -v p="$path" 'NR > 1 && $1 == p' /proc/swaps)
+    if [ -n "$active" ]; then
+        fits_without "\$1 == \"$path\"" || exit 4
+        swapoff "$path"
+    fi
+    rm -f "$path"
+    make() {
+        fallocate -l "$1" "$path" && chmod 600 "$path" && mkswap "$path" > /dev/null
+    }
+    if ! make "${1}G"; then
+        # Put the old size back so the system is not left without swap.
+        rm -f "$path"
+        [ "$have" -gt 0 ] && make "${have}K" && swapon "$path"
+        exit 1
+    fi
+    swapon "$path"
+    grep -qs "^$path[[:space:]]" /etc/fstab || printf '%s\tnone\tswap\tsw\t0\t0\n' "$path" >> /etc/fstab
+}
+
+do_zswap() {
+    [ -w "$ZSWAP/enabled" ] || exit 7
+    case "$1" in
+    1)
+        # zstd packs the most; keep the kernel's compressor when it has no zstd.
+        echo zstd > "$ZSWAP/compressor" 2> /dev/null || true
+        echo 1 > "$ZSWAP/enabled"
+        {
+            echo '# Written by Memory Sweep (Settings > Memory Optimization). Delete to undo.'
+            echo "w $ZSWAP/compressor - - - - $(cat "$ZSWAP/compressor")"
+            echo "w $ZSWAP/enabled - - - - 1"
+        } > "$ZSWAP_BOOT"
+        ;;
+    0)
+        echo 0 > "$ZSWAP/enabled"
+        rm -f "$ZSWAP_BOOT"
+        ;;
+    *) exit 2 ;;
+    esac
+}
+
+# vm.<name> now and after a restart (one sysctl.d file holds both values).
+do_vm() { # name value lowest highest
+    number "$2"
+    [ "$2" -ge "$3" ] && [ "$2" -le "$4" ] || exit 2
+    echo "$2" > "/proc/sys/vm/$1"
+    {
+        echo '# Written by Memory Sweep (Settings > Memory Optimization). Delete to undo.'
+        echo "vm.swappiness = $(cat /proc/sys/vm/swappiness)"
+        echo "vm.vfs_cache_pressure = $(cat /proc/sys/vm/vfs_cache_pressure)"
+    } > "$SYSCTL"
+}
+
+[ $# -gt 0 ] || exit 2
+tools='' zram='' file='' zswap='' swappiness='' cache=''
+for arg in "$@"; do
+    case "$arg" in
+    tools=*) tools=${arg#*=} ;;
+    zram=*:*) zram=${arg#*=} ;;
+    file=*) file=${arg#*=} ;;
+    zswap=*) zswap=${arg#*=} ;;
+    swappiness=*) swappiness=${arg#*=} ;;
+    cache_pressure=*) cache=${arg#*=} ;;
+    *) exit 2 ;;
+    esac
+done
+case "$tools" in
+''|install|reinstall|remove) ;;
+*) exit 2 ;;
+esac
+
+if [ "$tools" = install ] || [ "$tools" = reinstall ]; then
+    do_tools "$tools"; echo "ok tools"
+fi
+[ -z "$zram" ] || { do_zram "$zram"; echo "ok zram"; }
+[ -z "$file" ] || { do_file "$file"; echo "ok file"; }
+[ -z "$zswap" ] || { do_zswap "$zswap"; echo "ok zswap"; }
+[ -z "$swappiness" ] || { do_vm swappiness "$swappiness" 0 200; echo "ok swappiness"; }
+[ -z "$cache" ] || { do_vm vfs_cache_pressure "$cache" 1 500; echo "ok cache_pressure"; }
+if [ "$tools" = remove ]; then
+    do_tools remove; echo "ok tools"
+fi
+exit 0

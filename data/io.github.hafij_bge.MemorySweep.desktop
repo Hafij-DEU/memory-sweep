@@ -1,0 +1,23 @@
+[Desktop Entry]
+Name=Memory Sweep
+Comment=See what fills your RAM, then end it or remove it
+Exec=memory-sweep
+Icon=io.github.hafij_bge.MemorySweep
+Terminal=false
+Type=Application
+Categories=System;Monitor;
+Keywords=ram;memory;swap;zram;zswap;swappiness;process;kill;task;manager;tmp;tmpfs;free;
+StartupNotify=true
+Actions=apps;files;memory;
+
+[Desktop Action apps]
+Name=Apps Using RAM
+Exec=memory-sweep --page apps
+
+[Desktop Action files]
+Name=Files in RAM
+Exec=memory-sweep --page files
+
+[Desktop Action memory]
+Name=Memory Optimization
+Exec=memory-sweep --page memory
