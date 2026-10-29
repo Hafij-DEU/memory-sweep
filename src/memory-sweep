@@ -27,7 +27,7 @@ AI_STATEMENT = (
     "acceptance criteria in natural language. An AI coding agent (Claude Code, Anthropic, model "
     "Claude Opus) then inspected the system, wrote the code and tests, ran them, and fixed defects. "
     "The author reviewed the results and gave follow-up instructions.")
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROC = "/proc"
 UID = os.getuid()
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -814,16 +814,17 @@ def swap_command(args):
 
 
 def usage_sample():
-    """(RAM %, swap file or partition %, zram %) now; cheap enough for every 2 s."""
+    """(RAM total, RAM used, swap file or partition used, zram used) in bytes now; cheap
+    enough for every 2 s."""
     m = meminfo()
     total = m.get("MemTotal", 0)
-    ram = 100 * (total - m.get("MemAvailable", 0)) / total if total else 0
-    disk, comp = [0, 0], [0, 0]
-    for dev, _, size, used in swaps():
-        t = comp if "/zram" in dev else disk
-        t[0] += size
-        t[1] += used
-    return ram, 100 * disk[1] / disk[0] if disk[0] else 0, 100 * comp[1] / comp[0] if comp[0] else 0
+    disk = comp = 0
+    for dev, _, _, used in swaps():
+        if "/zram" in dev:
+            comp += used
+        else:
+            disk += used
+    return total, total - m.get("MemAvailable", 0), disk, comp
 
 
 # ---------------------------------------------------------------- settings
@@ -919,26 +920,30 @@ def report(as_json=False):
 # ---------------------------------------------------------------- GUI
 
 PALETTES = {
-    "dark": {"bg": "#0b1220", "side": "#0d1526", "card": "#111a2e", "raised": "#18233b",
-             "border": "#1f2b45", "fg": "#e7ecf6", "dim": "#8b97b1", "track": "#1c2740",
-             "accent": "#60a5fa"},
-    "light": {"bg": "#f4f6fb", "side": "#ffffff", "card": "#ffffff", "raised": "#eef2f9",
-              "border": "#e2e8f2", "fg": "#0f172a", "dim": "#64748b", "track": "#e6ebf3",
-              "accent": "#2563eb"},
+    "dark": {"bg": "#0a1020", "side": "#0c1427", "card": "#111a2f", "raised": "#18233c",
+             "row": "#151f36", "field": "#0d1528", "border": "#1e2a45", "fg": "#e7ecf6",
+             "dim": "#8d99b4", "track": "#1f2a44", "accent": "#60a5fa", "glow": "0.16"},
+    "light": {"bg": "#f2f5fb", "side": "#ffffff", "card": "#ffffff", "raised": "#eef2f9",
+              "row": "#f5f7fc", "field": "#ffffff", "border": "#e2e8f2", "fg": "#0f172a",
+              "dim": "#64748b", "track": "#e3e9f2", "accent": "#2563eb", "glow": "0.10"},
 }
 COLORS = {"blue": "#3b82f6", "purple": "#8b5cf6", "green": "#22c55e", "orange": "#f59e0b",
-          "red": "#ef4444"}
-# Sidebar pages; the first three are also the header tabs.
-PAGES = (("overview", "Overview", "view-grid-symbolic"),
-         ("apps", "Apps", "preferences-desktop-apps-symbolic"),
-         ("files", "Files in RAM", "folder-symbolic"),
-         ("settings", "Settings", "emblem-system-symbolic"),
-         ("about", "About", "help-about-symbolic"))
+          "red": "#ef4444", "cyan": "#06b6d4", "pink": "#ec4899", "teal": "#14b8a6"}
+# Second stop of each colour's gradient.
+GRADIENT_ENDS = {"blue": "#6366f1", "purple": "#d946ef", "green": "#14b8a6", "orange": "#f97316",
+                 "red": "#f43f5e", "cyan": "#3b82f6", "pink": "#f43f5e", "teal": "#06b6d4"}
+# Sidebar pages with their icon colour; the first three are also the start-page choices.
+PAGES = (("overview", "Overview", "go-home-symbolic", "blue"),
+         ("apps", "Apps", "view-grid-symbolic", "purple"),
+         ("files", "Files in RAM", "folder-symbolic", "orange"),
+         ("settings", "Settings", "emblem-system-symbolic", "green"),
+         ("about", "About", "help-about-symbolic", "cyan"))
 TABS = ("overview", "apps", "files")
-SETTING_PAGES = (("general", "General", "preferences-system-symbolic"),
-                 ("appearance", "Appearance", "preferences-desktop-appearance-symbolic"),
-                 ("memory", "Memory Optimization", "ms-zram-symbolic"),
-                 ("notifications", "Notifications", "preferences-system-notifications-symbolic"))
+HEADER_TABS = TABS + ("settings",)
+SETTING_PAGES = (("general", "General", "emblem-system-symbolic", "blue"),
+                 ("appearance", "Appearance", "preferences-desktop-appearance-symbolic", "pink"),
+                 ("memory", "Memory Optimization", "ms-ram-symbolic", "purple"),
+                 ("notifications", "Notifications", "preferences-system-notifications-symbolic", "orange"))
 CHART_SPANS = ((60, "Last 60 seconds"), (300, "Last 5 minutes"), (900, "Last 15 minutes"))
 SAMPLE_SECONDS = 2
 REFRESH_CHOICES = (2, 5, 10)
@@ -947,7 +952,7 @@ CSS = string.Template("""
 :root {
   --window-bg-color: $bg; --window-fg-color: $fg;
   --view-bg-color: $bg; --view-fg-color: $fg;
-  --headerbar-bg-color: $bg; --headerbar-fg-color: $fg; --headerbar-backdrop-color: $bg;
+  --headerbar-bg-color: transparent; --headerbar-fg-color: $fg; --headerbar-backdrop-color: transparent;
   --headerbar-shade-color: transparent; --headerbar-darker-shade-color: $border;
   --sidebar-bg-color: $side; --sidebar-fg-color: $fg; --sidebar-backdrop-color: $side;
   --sidebar-border-color: $border; --sidebar-shade-color: transparent;
@@ -957,54 +962,104 @@ CSS = string.Template("""
   --accent-bg-color: #3b82f6; --accent-fg-color: #ffffff; --accent-color: $accent;
   --border-color: $border;
 }
+.ms-main {
+  background-color: $bg;
+  background-image: radial-gradient(circle at 10% 0%, alpha(#3b82f6, $glow), transparent 40%),
+                    radial-gradient(circle at 95% 100%, alpha(#8b5cf6, $glow), transparent 45%),
+                    radial-gradient(circle at 60% 45%, alpha(#06b6d4, 0.05), transparent 40%);
+}
+.ms-side { background-image: linear-gradient(180deg, $side, $bg); }
 .ms-brand { font-weight: 800; font-size: 13pt; }
 .ms-nav, .ms-nav > row, .ms-list, .ms-list > row { background: transparent; }
-.ms-nav > row { border-radius: 10px; padding: 10px 12px; margin: 2px 0; color: $dim; }
+.ms-nav > row { border-radius: 12px; padding: 11px 14px; margin: 3px 0; color: $dim; }
 .ms-nav > row:hover { background: $raised; color: $fg; }
-.ms-nav > row:selected { background: alpha(#3b82f6, 0.16); color: $accent; font-weight: 700; }
+.ms-nav > row:selected { background-image: linear-gradient(90deg, #3b82f6, #6366f1); color: #ffffff;
+  font-weight: 700; box-shadow: 0 6px 18px alpha(#3b82f6, 0.35); }
+.ms-nav > row:selected image { color: #ffffff; }
+toggle-group.ms-tabs { background: alpha($card, 0.8); border: 1px solid $border; border-radius: 14px;
+  padding: 4px; }
+toggle-group.ms-tabs > separator { opacity: 0; }
+toggle-group.ms-tabs > toggle { border-radius: 10px; padding: 6px 18px; font-weight: 700; color: $dim; }
+toggle-group.ms-tabs > toggle:hover { color: $fg; }
+toggle-group.ms-tabs > toggle:active, toggle-group.ms-tabs > toggle:checked {
+  background-image: linear-gradient(90deg, #3b82f6, #6366f1); color: #ffffff;
+  box-shadow: 0 4px 14px alpha(#3b82f6, 0.35); }
 .ms-h1 { font-size: 20pt; font-weight: 800; }
 .ms-h2 { font-size: 12.5pt; font-weight: 700; }
 .ms-strong { font-weight: 700; }
 .ms-dim { color: $dim; }
 .ms-small { font-size: 9pt; }
 .ms-num, .size { font-feature-settings: "tnum"; }
-.ms-value { font-size: 22pt; font-weight: 800; font-feature-settings: "tnum"; }
-.ms-card { background: $card; border: 1px solid $border; border-radius: 16px; padding: 18px; }
-.ms-click:hover { background: $raised; }
+.ms-value { font-size: 17pt; font-weight: 800; font-feature-settings: "tnum"; }
+.ms-pct { font-size: 13pt; font-weight: 800; font-feature-settings: "tnum"; }
+.ms-card { background-color: $card; border: 1px solid $border; border-radius: 18px; padding: 18px;
+  box-shadow: 0 8px 24px alpha(black, 0.12); }
+.ms-row { background-color: $row; border: 1px solid alpha($border, 0.7); border-radius: 14px; padding: 12px 14px; }
+.ms-click:hover { border-color: alpha($accent, 0.6); }
 .ms-flow > flowboxchild { padding: 0; background: none; }
 .ms-icon { border-radius: 999px; min-width: 40px; min-height: 40px; }
 .ms-icon.small { min-width: 34px; min-height: 34px; }
-.ms-icon.blue { background: alpha(#3b82f6, 0.16); color: #3b82f6; }
-.ms-icon.purple { background: alpha(#8b5cf6, 0.16); color: #8b5cf6; }
-.ms-icon.green { background: alpha(#22c55e, 0.16); color: #22c55e; }
-.ms-icon.orange { background: alpha(#f59e0b, 0.16); color: #f59e0b; }
-.ms-icon.red { background: alpha(#ef4444, 0.16); color: #ef4444; }
-progressbar.ms-bar > trough { min-height: 8px; min-width: 40px; border-radius: 99px; background: $track; }
-progressbar.ms-bar > trough > progress { min-height: 8px; border-radius: 99px; background: #3b82f6; }
-progressbar.ms-bar.thin > trough, progressbar.ms-bar.thin > trough > progress { min-height: 6px; }
-progressbar.ms-bar.purple > trough > progress { background: #8b5cf6; }
-progressbar.ms-bar.green > trough > progress { background: #22c55e; }
-progressbar.ms-bar.orange > trough > progress { background: #f59e0b; }
-progressbar.ms-bar.red > trough > progress { background: #ef4444; }
+.ms-icon.big { min-width: 50px; min-height: 50px; }
+.ms-icon.square { border-radius: 12px; }
+progressbar.ms-bar > trough { min-height: 10px; min-width: 40px; border-radius: 99px; background: $track; }
+progressbar.ms-bar > trough > progress { min-height: 10px; border-radius: 99px; }
+progressbar.ms-bar.thin > trough, progressbar.ms-bar.thin > trough > progress { min-height: 7px; }
 .ms-pill { border-radius: 99px; padding: 4px 12px; font-weight: 700; font-size: 9.5pt; }
-.ms-pill.green { background: alpha(#22c55e, 0.14); color: #22c55e; }
-.ms-pill.orange { background: alpha(#f59e0b, 0.14); color: #f59e0b; }
-.ms-pill.red { background: alpha(#ef4444, 0.14); color: #ef4444; }
-.ms-pill.blue { background: alpha(#3b82f6, 0.14); color: $accent; }
 .ms-pill.dim { background: $raised; color: $dim; }
-.ms-banner { background: alpha(#3b82f6, 0.10); border: 1px solid alpha(#3b82f6, 0.35); border-radius: 14px; padding: 14px 16px; }
-.ms-warn { background: alpha(#f59e0b, 0.10); border: 1px solid alpha(#f59e0b, 0.35); border-radius: 12px; padding: 10px 12px; }
+.ms-icon.dim { background: $raised; color: $dim; }
+.ms-status { font-weight: 700; }
+.ms-banner { background-image: linear-gradient(90deg, alpha(#3b82f6, 0.16), alpha(#8b5cf6, 0.10));
+  border: 1px solid alpha(#3b82f6, 0.35); border-radius: 16px; padding: 14px 16px; }
+.ms-warn { background: alpha(#f59e0b, 0.12); border: 1px solid alpha(#f59e0b, 0.40); border-radius: 12px; padding: 10px 12px; }
 .ms-warn image { color: #f59e0b; }
 separator.ms-sep { background: $border; min-height: 1px; }
 .ms-list > row { border-radius: 10px; padding: 7px 6px; }
 .ms-list > row:hover { background: $raised; }
 .ms-head { color: $dim; font-size: 9pt; font-weight: 700; }
 .ms-dot { border-radius: 99px; min-width: 10px; min-height: 10px; }
-.ms-dot.blue { background: #3b82f6; }
-.ms-dot.purple { background: #8b5cf6; }
-.ms-dot.green { background: #22c55e; }
 button.ms-link { color: $accent; font-weight: 700; }
+button.ms-outline { border: 1px solid alpha($accent, 0.55); color: $accent; border-radius: 99px;
+  background: transparent; padding: 4px 14px; font-weight: 700; }
+button.ms-outline:hover { background: alpha($accent, 0.12); }
+button.ms-ghost { background: $raised; border-radius: 12px; padding: 8px 14px; font-weight: 700; }
+button.ms-ghost:hover { background: alpha($accent, 0.16); }
+button.ms-primary { background-image: linear-gradient(90deg, #3b82f6, #6366f1); color: #ffffff;
+  border-radius: 12px; padding: 8px 16px; font-weight: 700; box-shadow: 0 6px 18px alpha(#3b82f6, 0.35); }
+button.ms-primary:disabled { opacity: 0.45; box-shadow: none; }
+button.ms-soft { border-radius: 99px; padding: 6px 14px; font-weight: 700; }
+spinbutton.ms-spin { background: none; border: none; box-shadow: none; outline: none; }
+spinbutton.ms-spin > text { background: $field; border: 1px solid $border; border-radius: 10px;
+  min-width: 48px; padding: 6px 10px; font-weight: 700; }
+spinbutton.ms-spin > button { border-radius: 99px; background: $raised; margin-left: 8px;
+  min-width: 34px; min-height: 34px; padding: 0; border: none; }
+spinbutton.ms-spin > button:hover { background: alpha($accent, 0.25); }
+scale.ms-scale trough { min-height: 6px; border-radius: 99px; background: $track; }
+scale.ms-scale highlight { border-radius: 99px; background-image: linear-gradient(90deg, #3b82f6, #8b5cf6); }
+scale.ms-scale slider { background: #ffffff; min-width: 18px; min-height: 18px; border-radius: 99px;
+  box-shadow: 0 0 0 4px alpha(#3b82f6, 0.35); }
+.boxed-list { border-radius: 16px; }
+.ms-size { border-radius: 99px; padding: 3px 10px; font-weight: 700; background: alpha(#3b82f6, 0.16); color: $accent; }
 """)
+
+
+def color_css():
+    """The per-colour rules: tinted and solid icon tiles, bars, pills, cards and buttons."""
+    rules = []
+    for name, c in COLORS.items():
+        e = GRADIENT_ENDS[name]
+        rules.append(f"""
+.ms-icon.{name} {{ background: alpha({c}, 0.18); color: {c}; }}
+.ms-icon.solid.{name} {{ background-image: linear-gradient(135deg, {c}, {e}); color: #ffffff;
+  box-shadow: 0 6px 16px alpha({c}, 0.35); }}
+.ms-tint.{name} {{ color: {c}; }}
+progressbar.ms-bar.{name} > trough > progress {{ background-image: linear-gradient(90deg, {c}, {e}); }}
+.ms-pill.{name} {{ background: alpha({c}, 0.16); color: {c}; }}
+.ms-dot.{name} {{ background: {c}; }}
+.ms-card.{name} {{ background-image: linear-gradient(135deg, alpha({c}, 0.20), alpha({e}, 0.03) 60%);
+  border-color: alpha({c}, 0.35); }}
+button.ms-soft.{name} {{ background: alpha({c}, 0.18); color: {c}; }}
+button.ms-soft.{name}:hover {{ background: alpha({c}, 0.30); }}""")
+    return "".join(rules)
 
 
 def run_gui(page):
@@ -1026,23 +1081,47 @@ def run_gui(page):
         return lbl
 
     def size_label(text=""):
-        return label(text, "size", "dim-label", valign=CENTER)
+        return label(text, "size", "ms-size", valign=CENTER)
 
     def end_button(cb, text="End"):
-        b = Gtk.Button(label=text, valign=CENTER)
-        b.add_css_class("flat")
+        b = Gtk.Button(label=text, valign=CENTER, css_classes=["ms-soft", "red"])
         b.connect("clicked", lambda *_: cb())
         return b
 
-    def badge(icon, color, small=False):
+    def badge(icon, color, small=False, solid=False, big=False, square=False):
+        """Round icon tile: tinted, or `solid` (gradient fill, white icon)."""
         # hexpand/vexpand=False: the centred image inside would otherwise make the badge, and the
         # card holding it, grab spare width and height.
         b = Gtk.Box(halign=Gtk.Align.START, valign=CENTER, hexpand=False, vexpand=False)
-        for c in ("ms-icon", color) + (("small",) if small else ()):
-            b.add_css_class(c)
-        b.append(Gtk.Image(icon_name=icon, pixel_size=16 if small else 18,
+        for c, on in (("ms-icon", True), (color, True), ("small", small), ("solid", solid),
+                      ("big", big), ("square", square)):
+            if on:
+                b.add_css_class(c)
+        b.append(Gtk.Image(icon_name=icon, pixel_size=22 if big else 16 if small else 18,
                            hexpand=True, vexpand=True, halign=CENTER, valign=CENTER))
         return b
+
+    def icon_button(icon, text, *classes):
+        b = Gtk.Button(valign=CENTER)
+        inner = Gtk.Box(spacing=8, halign=CENTER)
+        inner.append(Gtk.Image(icon_name=icon))
+        b.text = Gtk.Label(label=text)
+        inner.append(b.text)
+        b.set_child(inner)
+        for c in classes:
+            b.add_css_class(c)
+        return b
+
+    def card_head(icon, color, title, subtitle=None, solid=False):
+        """Icon tile, title and an optional line under it; returns (box, names box)."""
+        head = Gtk.Box(spacing=12)
+        head.append(badge(icon, color, small=not solid, solid=solid, square=True))
+        names = Gtk.Box(orientation=V, spacing=2, hexpand=True, valign=CENTER)
+        names.append(label(title, "ms-h2"))
+        if subtitle:
+            names.append(label(subtitle, "ms-dim", "ms-small", wrap=True))
+        head.append(names)
+        return head, names
 
     def bar(color="blue", thin=False):
         pb = Gtk.ProgressBar(valign=CENTER)
@@ -1050,9 +1129,11 @@ def run_gui(page):
             pb.add_css_class(c)
         return pb
 
-    def card(spacing=12, vertical=True, **kw):
+    def card(spacing=12, vertical=True, color=None, **kw):
         c = Gtk.Box(orientation=V if vertical else Gtk.Orientation.HORIZONTAL, spacing=spacing, **kw)
         c.add_css_class("ms-card")
+        if color:
+            c.add_css_class(color)
         return c
 
     def sep():
@@ -1119,40 +1200,43 @@ def run_gui(page):
             return self.cache[key]
 
     class StatCard(Gtk.Box):
-        def __init__(self, title, icon, color, columns, on_click=None):
-            super().__init__(orientation=V, spacing=12, width_request=210)
+        """Overview card: solid icon, title, value and percent, a bar and up to four detail cells."""
+
+        def __init__(self, title, icon, color, on_click=None):
+            super().__init__(orientation=V, spacing=14, width_request=230)
             self.add_css_class("ms-card")
-            top = Gtk.Box(spacing=12)
-            top.append(badge(icon, color))
-            names = Gtk.Box(orientation=V, valign=CENTER, hexpand=True)
-            names.append(label(title, "ms-h2"))
-            self.sub = label("", "ms-dim", "ms-small", ellipsize=Pango.EllipsizeMode.END)
-            names.append(self.sub)
+            self.add_css_class(color)
+            top = Gtk.Box(spacing=14)
+            top.append(badge(icon, color, solid=True, big=True))
+            names = Gtk.Box(orientation=V, spacing=2, valign=CENTER, hexpand=True)
+            names.append(label(title, "ms-dim", "ms-strong", ellipsize=Pango.EllipsizeMode.END))
+            self.value = label("", "ms-value", ellipsize=Pango.EllipsizeMode.END)
+            names.append(self.value)
             top.append(names)
+            self.pct = label("", "ms-pct", "ms-tint", color, valign=Gtk.Align.START)
+            top.append(self.pct)
             if on_click:
-                top.append(Gtk.Image(icon_name="go-next-symbolic", css_classes=["ms-dim"]))
                 clickable(self, on_click)
             self.append(top)
-            self.value = label("", "ms-value")
-            self.append(self.value)
             self.bar = bar(color)
             self.append(self.bar)
-            row = Gtk.Box(homogeneous=True, spacing=8)
-            self.cols = []
-            for name in columns:
-                col = Gtk.Box(orientation=V, spacing=2)
-                col.append(label(name, "ms-dim", "ms-small"))
-                v = label("", "ms-num", ellipsize=Pango.EllipsizeMode.END)
-                col.append(v)
-                row.append(col)
-                self.cols.append(v)
-            self.append(row)
+            grid = Gtk.Grid(column_spacing=8, row_spacing=4, column_homogeneous=True)
+            self.cells = []
+            for i in range(4):
+                c = label("", "ms-dim", "ms-small", "ms-num", xalign=i % 2,
+                          ellipsize=Pango.EllipsizeMode.END)
+                grid.attach(c, i % 2, i // 2, 1, 1)
+                self.cells.append(c)
+            self.append(grid)
 
-        def update(self, value, fraction, sub, values):
-            self.value.set_label(value)
+        def update(self, value, pct, fraction, cells):
+            # "used / total": the total smaller and dimmer, so the value fits narrow cards.
+            used, sep_, total = value.partition(" / ")
+            self.value.set_markup(GLib.markup_escape_text(used) + (
+                f"<span size='72%' alpha='65%'> / {GLib.markup_escape_text(total)}</span>" if sep_ else ""))
+            self.pct.set_label(pct)
             self.bar.set_fraction(max(0, min(1, fraction)))
-            self.sub.set_label(sub)
-            for lbl, v in zip(self.cols, values):
+            for lbl, v in zip(self.cells, list(cells) + [""] * 4):
                 lbl.set_label(v)
 
     class Window(Adw.ApplicationWindow):
@@ -1189,25 +1273,28 @@ def run_gui(page):
             self.stack.add_named(self._about(), "about")
             self.toasts = Adw.ToastOverlay(child=self.stack)
 
-            self.tabs = Adw.ToggleGroup(valign=CENTER)
-            for name, title, _ in PAGES:
-                if name in TABS:
-                    self.tabs.add(Adw.Toggle(name=name, label=title))
+            self.tabs = Adw.ToggleGroup(valign=CENTER, css_classes=["ms-tabs"])
+            for name, title, icon, _ in PAGES:
+                if name in HEADER_TABS:
+                    tab = Gtk.Box(spacing=8)
+                    tab.append(Gtk.Image(icon_name=icon))
+                    tab.append(Gtk.Label(label=title))
+                    self.tabs.add(Adw.Toggle(name=name, child=tab))
             self.tabs.connect("notify::active-name",
                               lambda *_: self.syncing or self.show_page(self.tabs.get_active_name()))
             self.header_title = Adw.WindowTitle()
             self.header = Adw.HeaderBar(title_widget=self.tabs)
-            self.sidebar_btn = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", tooltip_text="Sidebar",
-                                                visible=False)
+            self.sidebar_btn = Gtk.ToggleButton(icon_name="sidebar-show-symbolic",
+                                                tooltip_text="Show or hide the sidebar")
             self.header.pack_start(self.sidebar_btn)
-            content = Adw.ToolbarView(content=self.toasts)
+            content = Adw.ToolbarView(content=self.toasts, css_classes=["ms-main"])
             content.add_top_bar(self.header)
 
             self.nav = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
             self.nav.add_css_class("ms-nav")
             self.nav_rows = {}
-            for name, title, icon in PAGES:
-                row = self._nav_row(title, icon)
+            for name, title, icon, color in PAGES:
+                row = self._nav_row(title, icon, color)
                 row.name = name
                 self.nav.append(row)
                 self.nav_rows[name] = row
@@ -1220,7 +1307,12 @@ def run_gui(page):
             side.append(self.nav)
             side.append(Gtk.Box(vexpand=True))
             side.append(label(f"Version {VERSION}", "ms-dim", "ms-small", margin_start=12))
-            side_view = Adw.ToolbarView(content=side)
+            side.append(label(f"Developed by {AUTHOR}", "ms-dim", "ms-small", margin_start=12,
+                              margin_top=4, wrap=True))
+            side.append(label("Built with AI: written by Claude Code (Anthropic) from the author's "
+                              "instructions, reviewed by the author.", "ms-dim", "ms-small",
+                              margin_start=12, margin_top=4, wrap=True, tooltip_text=AI_STATEMENT))
+            side_view = Adw.ToolbarView(content=side, css_classes=["ms-side"])
             side_view.add_top_bar(side_header)
 
             self.split = Adw.OverlaySplitView(sidebar=side_view, content=content,
@@ -1241,7 +1333,6 @@ def run_gui(page):
                     bp.add_setter(widget, prop, value)
                 self.add_breakpoint(bp)
             small.add_setter(self.split, "collapsed", True)
-            small.add_setter(self.sidebar_btn, "visible", True)
 
             self.refresh()
             self._sample()
@@ -1251,19 +1342,21 @@ def run_gui(page):
 
         # ---- building blocks
 
-        def _nav_row(self, title, icon):
+        def _nav_row(self, title, icon, color):
             row = Gtk.ListBoxRow()
             b = Gtk.Box(spacing=12)
-            b.append(Gtk.Image(icon_name=icon))
+            b.append(Gtk.Image(icon_name=icon, css_classes=["ms-tint", color]))
             b.append(Gtk.Label(label=title, xalign=0))
             row.set_child(b)
             return row
 
-        def _page(self, title, subtitle, *extra):
+        def _page(self, title, subtitle, *extra, icon=None, color="blue"):
             """A scrolled page with a big title; returns (page, body)."""
             body = Gtk.Box(orientation=V, spacing=22, margin_top=8, margin_bottom=28,
                            margin_start=28, margin_end=28)
             head = Gtk.Box(spacing=16)
+            if icon:
+                head.append(badge(icon, color, solid=True, big=True, square=True))
             names = Gtk.Box(orientation=V, spacing=4, hexpand=True, valign=CENTER)
             names.append(label(title, "ms-h1"))
             self.page_sub = label(subtitle, "ms-dim", wrap=True)
@@ -1285,59 +1378,60 @@ def run_gui(page):
         # ---- overview
 
         def _overview(self):
-            self.health = label("", "ms-pill", valign=CENTER)
-            when = Gtk.Box(orientation=V, valign=CENTER)
-            when.append(label("Last updated", "ms-dim", "ms-small", xalign=1))
-            self.updated = label("–", "ms-num", xalign=1)
-            when.append(self.updated)
+            self.health = label("", "ms-status", valign=CENTER)
+            self.updated = label("", "ms-dim", "ms-small", "ms-num", valign=CENTER)
             refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh now", valign=CENTER)
             refresh.add_css_class("circular")
+            refresh.add_css_class("flat")
             refresh.connect("clicked", lambda *_: self.refresh(files=True))
             page, body = self._page("System Overview",
                                     "Live memory use, and suggestions to keep your system running smoothly.",
-                                    self.health, when, refresh)
+                                    self.health, self.updated, refresh)
 
-            cards = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
-                                min_children_per_line=1, max_children_per_line=4,
-                                column_spacing=16, row_spacing=16)
-            cards.add_css_class("ms-flow")
-            self.narrow.append((cards, "max-children-per-line", 2))  # 2 + 2 rather than 3 + 1
-            self.ram_card = StatCard("RAM", "ms-ram-symbolic", "blue", ("Used", "Available", "Total"))
-            self.swap_card = StatCard("Swap", "ms-swap-symbolic", "purple", ("Used", "Free", "Total"),
+            # Four in a row; two pairs stacked when narrow (a FlowBox would go by natural
+            # width and wrap 3 + 1).
+            cards = Gtk.Box(spacing=16, homogeneous=True)
+            self.narrow.append((cards, "orientation", V))
+            self.ram_card = StatCard("RAM", "ms-ram-symbolic", "blue")
+            self.swap_card = StatCard("Swap", "ms-swap-symbolic", "purple",
                                       on_click=lambda: self.show_page("memory"))
-            self.zram_card = StatCard("zram", "ms-zram-symbolic", "green", ("Used", "In RAM", "Size"),
+            self.zram_card = StatCard("Compressed (zram)", "ms-zram-symbolic", "green",
                                       on_click=lambda: self.show_page("memory"))
             self.files_card = StatCard("Files held in RAM", "folder-symbolic", "orange",
-                                       ("Used", "Free", "Size"), on_click=lambda: self.show_page("files"))
-            for c in (self.ram_card, self.swap_card, self.zram_card, self.files_card):
-                cards.append(c)
+                                       on_click=lambda: self.show_page("files"))
+            for pair in ((self.ram_card, self.swap_card), (self.zram_card, self.files_card)):
+                box = Gtk.Box(spacing=16, homogeneous=True)
+                for c in pair:
+                    box.append(c)
+                cards.append(box)
             body.append(cards)
 
-            tips = Gtk.Box(orientation=V, spacing=12)
-            head = Gtk.Box(spacing=10)
-            head.append(label("Suggestions", "ms-h2", valign=CENTER))
-            self.tips_count = label("", "ms-pill", "blue", valign=CENTER)
-            head.append(self.tips_count)
-            head.append(Gtk.Box(hexpand=True))
-            self.see_all = link("See all", self._toggle_tips)
+            tips = card(spacing=14)
+            head, names = card_head("ms-bulb-symbolic", "orange", "Suggestions")
+            self.tips_count = label("", "ms-pill", "orange", valign=CENTER)
+            head.insert_child_after(self.tips_count, names)
+            self.see_all = Gtk.Button(label="See all", valign=CENTER, css_classes=["ms-outline"])
+            self.see_all.connect("clicked", lambda *_: self._toggle_tips())
             head.append(self.see_all)
             tips.append(head)
             self.tips_box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
-                                        min_children_per_line=1, max_children_per_line=3,
-                                        column_spacing=16, row_spacing=16)
+                                        min_children_per_line=1, max_children_per_line=4,
+                                        column_spacing=14, row_spacing=14)
             self.tips_box.add_css_class("ms-flow")
             tips.append(self.tips_box)
             body.append(tips)
 
             apps = card(spacing=10, hexpand=True)
-            head = Gtk.Box()
-            head.append(label("Biggest apps", "ms-h2", hexpand=True, valign=CENTER))
-            head.append(link("View all", lambda: self.show_page("apps")))
+            head, _ = card_head("ms-bars-symbolic", "blue", "Biggest apps")
+            view_all = Gtk.Button(label="View all", valign=CENTER, css_classes=["ms-outline"])
+            view_all.connect("clicked", lambda *_: self.show_page("apps"))
+            head.append(view_all)
             apps.append(head)
-            cols = Gtk.Box(spacing=12, margin_start=6, margin_end=6)
+            cols = Gtk.Box(spacing=12, margin_start=6, margin_end=6, margin_top=4)
             cols.append(label("App", "ms-head", hexpand=True))
-            cols.append(label("Processes", "ms-head", xalign=1, width_request=72))
-            cols.append(label("Memory", "ms-head", width_request=220))
+            cols.append(label("Processes", "ms-head", xalign=0.5, width_request=80))
+            cols.append(label("Memory", "ms-head", xalign=1, width_request=80))
+            cols.append(Gtk.Box(width_request=150))
             apps.append(cols)
             self.top_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
             self.top_list.add_css_class("ms-list")
@@ -1345,8 +1439,7 @@ def run_gui(page):
             apps.append(self.top_list)
 
             chart = card(spacing=10, hexpand=True)
-            head = Gtk.Box(spacing=8)
-            head.append(label("Memory Usage Chart", "ms-h2", hexpand=True, valign=CENTER))
+            head, _ = card_head("ms-chart-symbolic", "purple", "Memory Usage Chart")
             self.span = Gtk.DropDown.new_from_strings([t for _, t in CHART_SPANS])
             self.span.set_valign(CENTER)
             self.span.connect("notify::selected", lambda *_: self.chart.queue_draw())
@@ -1354,16 +1447,13 @@ def run_gui(page):
             chart.append(head)
             self.chart = Chart(self._draw_chart)
             chart.append(self.chart)
-            legend = Gtk.Box(spacing=18, halign=CENTER)
+            legend = Gtk.Box(spacing=22, halign=CENTER)
             self.legend = {}
-            for key, name, color in (("ram", "RAM", "blue"), ("swap", "Swap", "purple"),
-                                     ("zram", "zram", "green")):
-                item = Gtk.Box(spacing=6)
-                dot = Gtk.Box(valign=CENTER)
-                dot.add_css_class("ms-dot")
-                dot.add_css_class(color)
+            for key, color in (("ram", "blue"), ("swap", "purple"), ("zram", "green")):
+                item = Gtk.Box(spacing=7)
+                dot = Gtk.Box(valign=CENTER, css_classes=["ms-dot", color])
                 item.append(dot)
-                self.legend[key] = label(name, "ms-dim", "ms-small")
+                self.legend[key] = label("", "ms-small")
                 item.append(self.legend[key])
                 legend.append(item)
             chart.append(legend)
@@ -1372,39 +1462,45 @@ def run_gui(page):
 
         def _apply_overview(self, snap):
             pct = 100 * snap.used / snap.total if snap.total else 0
-            if pct >= 90:
-                pill(self.health, "red", "● Almost full")
-            elif pct >= 75:
-                pill(self.health, "orange", "● Busy")
-            else:
-                pill(self.health, "green", "● Healthy")
-            self.updated.set_label(time.strftime("%H:%M:%S", time.localtime(snap.time)))
-            self.ram_card.update(f"{pct:.0f}%", pct / 100,
-                                 f"{fmt_size(snap.used)} of {fmt_size(snap.total)} in use",
-                                 (fmt_size(snap.used), fmt_size(snap.available), fmt_size(snap.total)))
+            color, text = ("red", "Almost full") if pct >= 90 else ("orange", "Busy") if pct >= 75 \
+                else ("green", "System running smoothly")
+            self.health.set_css_classes(["ms-status", "ms-tint", color])
+            self.health.set_label(f"●  {text}")
+            self._show_updated()
+            self.ram_card.update(f"{fmt_size(snap.used)} / {fmt_size(snap.total)}", f"{pct:.0f}%",
+                                 pct / 100, (f"Used: {fmt_size(snap.used)}", f"Total: {fmt_size(snap.total)}",
+                                             f"Available: {fmt_size(snap.available)}"))
             size, used = snap.swap_parts(zram=False)
             if size:
                 devs = [os.path.basename(d) for d, _, _, _ in snap.swaps if "/zram" not in d]
-                self.swap_card.update(f"{100 * used / size:.0f}%", used / size, ", ".join(devs),
-                                      (fmt_size(used), fmt_size(size - used), fmt_size(size)))
+                self.swap_card.update(f"{fmt_size(used)} / {fmt_size(size)}", f"{100 * used / size:.0f}%",
+                                      used / size, (f"Used: {fmt_size(used)}", f"Total: {fmt_size(size)}",
+                                                    f"Free: {fmt_size(size - used)}", ", ".join(devs)))
             else:
-                self.swap_card.update("Off", 0, "No swap file or partition", ("–", "–", "–"))
+                self.swap_card.update("Off", "–", 0, ("No swap file or partition",))
             size, used = snap.swap_parts(zram=True)
             stored = sum(s for _, s, _ in snap.zram)
             in_ram = sum(r for _, _, r in snap.zram)
             if size:
-                ratio = f"{stored / in_ram:.1f}× compression" if in_ram else "Compressed swap in RAM"
-                self.zram_card.update(f"{100 * used / size:.0f}%", used / size, ratio,
-                                      (fmt_size(used), fmt_size(in_ram), fmt_size(size)))
+                ratio = f"{stored / in_ram:.1f}× packed" if in_ram else "Nothing packed yet"
+                self.zram_card.update(f"{fmt_size(used)} / {fmt_size(size)}", f"{100 * used / size:.0f}%",
+                                      used / size, (f"Stored: {fmt_size(stored)}", ratio,
+                                                    f"In RAM: {fmt_size(in_ram)}", f"Size: {fmt_size(size)}"))
             else:
-                self.zram_card.update("Off", 0, "Turn it on in Settings", ("–", "–", "–"))
+                self.zram_card.update("Off", "–", 0, ("Turn it on in Settings",))
             used = sum(u for _, u, _ in snap.mounts)
             size = sum(t for _, _, t in snap.mounts)
-            self.files_card.update(f"{100 * used / size:.0f}%" if size else "–", used / size if size else 0,
-                                   " and ".join(mp for mp, _, _ in snap.mounts) or "No RAM folders",
-                                   (fmt_size(used), fmt_size(size - used), fmt_size(size)))
+            self.files_card.update(fmt_size(used), f"{100 * used / size:.0f}%" if size else "–",
+                                   used / size if size else 0,
+                                   [f"{mp}: {fmt_size(u)}" for mp, u, _ in snap.mounts][:2]
+                                   + [f"Room for {fmt_size(size - used)} more"] if size else ("No RAM folders",))
             self._show_tips(snap)
             self._show_top(snap)
+
+        def _show_updated(self):
+            if self.snap:
+                ago = max(0, round(time.time() - self.snap.time))
+                self.updated.set_label(f"Last updated: {ago} s ago")
 
         def _toggle_tips(self):
             self.all_tips = not self.all_tips
@@ -1413,40 +1509,45 @@ def run_gui(page):
 
         def _show_tips(self, snap):
             tips = snap.tips()
-            shown = tips if self.all_tips else tips[:3]
+            shown = tips if self.all_tips else tips[:4]
             self.tips_count.set_label(str(len(tips)))
             self.tips_count.set_visible(bool(tips))
-            self.see_all.set_visible(len(tips) > 3)
+            self.see_all.set_visible(len(tips) > 4)
             self.see_all.set_label("Show less" if self.all_tips else "See all")
             if shown == self.tips_shown:
                 return
             self.tips_shown = shown
             self.tips_box.remove_all()
-            for kind, text, page, key in shown:
-                self.tips_box.append(self._tip_card(snap, kind, text, page, key))
+            self.tips_box.set_max_children_per_line(max(1, min(4, len(shown))))
+            for i, (kind, text, page, key) in enumerate(shown):
+                self.tips_box.append(self._tip_card(snap, i, kind, text, page, key))
             if not tips:
-                c = card(spacing=12, vertical=False)
-                c.append(badge("object-select-symbolic", "green", small=True))
+                c = Gtk.Box(spacing=12, css_classes=["ms-row"])
+                c.append(badge("object-select-symbolic", "green", solid=True))
                 texts = Gtk.Box(orientation=V, valign=CENTER)
                 texts.append(label("Nothing stands out right now", "ms-strong"))
                 texts.append(label("Memory use looks healthy.", "ms-dim", "ms-small"))
                 c.append(texts)
                 self.tips_box.append(c)
 
-        def _tip_card(self, snap, kind, text, page, key):
-            color, icon = {"files": ("orange", "folder-symbolic"), "end": ("red", "process-stop-symbolic"),
-                           "zram": ("green", "ms-zram-symbolic")}.get(
-                kind, ("blue", "preferences-desktop-apps-symbolic"))
-            c = card(spacing=12, vertical=False)
-            c.append(badge(icon, color, small=True))
-            c.append(label(text, wrap=True, hexpand=True, valign=CENTER))
+        def _tip_card(self, snap, index, kind, text, page, key):
+            icon = {"files": "folder-symbolic", "end": "process-stop-symbolic",
+                    "zram": "ms-zram-symbolic"}.get(kind, "view-grid-symbolic")
+            color = ("blue", "purple", "green", "orange")[index % 4]
+            c = Gtk.Box(orientation=V, spacing=12, css_classes=["ms-row"])
+            top = Gtk.Box(spacing=14, vexpand=True)
+            top.append(badge(icon, color, solid=True))
+            # max_width_chars keeps the natural width small so four tiles fit in a row.
+            top.append(label(text, wrap=True, hexpand=True, valign=CENTER, lines=3, max_width_chars=24,
+                             ellipsize=Pango.EllipsizeMode.END))
+            c.append(top)
             if kind == "end":
                 grp = next(g for g in snap.groups if g.key == key)
-                b = Gtk.Button(label="End", valign=CENTER)
-                b.add_css_class("destructive-action")
+                b = Gtk.Button(label="End", css_classes=["ms-soft", "red"], margin_start=54)
                 b.connect("clicked", lambda *_: self.confirm_end(grp, grp.instances))
             else:
-                b = Gtk.Button(label="Set up" if kind == "zram" else "Review", valign=CENTER)
+                b = Gtk.Button(label="Set up" if kind == "zram" else "Review",
+                               css_classes=["ms-soft", "green" if kind == "zram" else "blue"], margin_start=54)
                 b.connect("clicked", lambda *_: self._review(page, key))
             c.append(b)
             return c
@@ -1455,7 +1556,7 @@ def run_gui(page):
             self.top_list.remove_all()
             groups = snap.groups[:6]
             biggest = groups[0].mem if groups and groups[0].mem else 1
-            for g in groups:
+            for i, g in enumerate(groups):
                 row = Gtk.ListBoxRow(activatable=True)
                 row.key = g.key
                 b = Gtk.Box(spacing=12)
@@ -1465,34 +1566,36 @@ def run_gui(page):
                 img.set_pixel_size(24)
                 b.append(img)
                 b.append(label(g.title, hexpand=True, ellipsize=Pango.EllipsizeMode.END))
-                b.append(label(str(len(g.procs)), "ms-num", "ms-dim", xalign=1, width_request=72))
-                mem = Gtk.Box(spacing=10, width_request=220, hexpand=False)
-                pb = bar("blue", thin=True)
-                pb.set_hexpand(True)
+                b.append(label(str(len(g.procs)), "ms-num", "ms-dim", xalign=0.5, width_request=80))
+                b.append(label(fmt_size(g.mem), "ms-num", "ms-strong", xalign=1, width_request=80))
+                pb = bar(("blue", "cyan", "purple", "pink", "orange", "green")[i], thin=True)
+                pb.set_size_request(150, -1)
                 pb.set_fraction(g.mem / biggest)
-                mem.append(pb)
-                mem.append(label(fmt_size(g.mem), "ms-num", xalign=1, width_chars=8))
-                b.append(mem)
+                b.append(pb)
                 row.set_child(b)
                 self.top_list.append(row)
 
         def _sample(self):
-            ram, swap, comp = usage_sample()
-            self.history.append((time.monotonic(), ram, swap, comp))
+            total, ram, swap, comp = usage_sample()
+            self.history.append((time.monotonic(), total, ram, swap, comp))
             for key, name, v in (("ram", "RAM", ram), ("swap", "Swap", swap), ("zram", "zram", comp)):
-                self.legend[key].set_label(f"{name} {v:.0f}%")
+                self.legend[key].set_markup(f"<b>{name}</b>  <span alpha='70%'>({fmt_size(v)})</span>")
+            self._show_updated()
             self.chart.queue_draw()
             return True
 
         def _draw_chart(self, chart, snap, w, h):
             pal = self.app.palette
             span = CHART_SPANS[self.span.get_selected()][0]
-            left, right, top, bottom = 42, 10, 8, 24
+            left, right, top, bottom = 58, 10, 8, 24
             pw, ph = w - left - right, h - top - bottom
-            if pw <= 0 or ph <= 0:
+            if pw <= 0 or ph <= 0 or not self.history:
                 return
             font = Pango.FontDescription.from_string("Sans 8")
             dim = rgba(pal["dim"])
+            now = time.monotonic()
+            pts = [p for p in self.history if now - p[0] <= span + SAMPLE_SECONDS]
+            top_value = max([self.history[-1][1]] + [max(p[2:]) for p in pts]) or 1
 
             def text(t, x, y, align=0.0):
                 layout = chart.create_pango_layout(t)
@@ -1503,35 +1606,46 @@ def run_gui(page):
                 snap.append_layout(layout, dim)
                 snap.restore()
 
-            for pct in (0, 25, 50, 75, 100):
-                y = round(top + ph * (1 - pct / 100))
-                snap.append_color(rgba(pal["border"]), Graphene.Rect().init(left, y, pw, 1))
-                text(f"{pct}%", left - 8, y, align=1)
-            ago = (lambda s: f"{s} s ago") if span < 120 else (lambda s: f"{s // 60} min ago")
-            for frac, t, align in ((0, ago(span), 0), (0.5, ago(span // 2), 0.5), (1, "now", 1)):
-                text(t, left + pw * frac, h - 8, align)
-            now = time.monotonic()
-            pts = [p for p in self.history if now - p[0] <= span + SAMPLE_SECONDS]
+            grid = rgba(pal["border"], 0.8)
+            for i in range(5):
+                y = round(top + ph * (1 - i / 4))
+                snap.append_color(grid, Graphene.Rect().init(left, y, pw, 1))
+                text(fmt_size(top_value * i / 4), left - 8, y, align=1)
+            for i in range(7):
+                x = round(left + pw * i / 6)
+                snap.append_color(grid, Graphene.Rect().init(x, top, 1, ph))
+                s = span - span * i // 6
+                t = "Now" if i == 6 else f"{s}s" if span < 120 else f"{s // 60}m"
+                text(t, x, h - 8, 0 if i == 0 else 1 if i == 6 else 0.5)
             if len(pts) < 2:
                 return
 
             def xy(t, v):
-                return left + pw * max(0, 1 - (now - t) / span), top + ph * (1 - min(100, v) / 100)
+                return left + pw * max(0, 1 - (now - t) / span), top + ph * (1 - min(top_value, v) / top_value)
 
-            stroke = Gsk.Stroke.new(2.2)
+            stroke = Gsk.Stroke.new(2.4)
             stroke.set_line_join(Gsk.LineJoin.ROUND)
-            for idx, color in ((3, COLORS["green"]), (2, COLORS["purple"]), (1, COLORS["blue"])):
-                line = Gsk.PathBuilder.new()
+            for idx, name in ((4, "green"), (3, "purple"), (2, "blue")):
+                color = COLORS[name]
+                line, area = Gsk.PathBuilder.new(), Gsk.PathBuilder.new()
                 for i, p in enumerate(pts):
                     (line.move_to if i == 0 else line.line_to)(*xy(p[0], p[idx]))
-                if idx == 1:  # soft fill under the RAM line
-                    area = Gsk.PathBuilder.new()
-                    for i, p in enumerate(pts):
-                        (area.move_to if i == 0 else area.line_to)(*xy(p[0], p[idx]))
-                    area.line_to(xy(pts[-1][0], 0)[0], top + ph)
-                    area.line_to(xy(pts[0][0], 0)[0], top + ph)
-                    area.close()
-                    snap.append_fill(area.to_path(), Gsk.FillRule.WINDING, rgba(color, 0.16))
+                    (area.move_to if i == 0 else area.line_to)(*xy(p[0], p[idx]))
+                area.line_to(xy(pts[-1][0], 0)[0], top + ph)
+                area.line_to(xy(pts[0][0], 0)[0], top + ph)
+                area.close()
+                # Gradient fill under each line, strongest at the top.
+                snap.push_fill(area.to_path(), Gsk.FillRule.WINDING)
+                stops = []
+                for offset, alpha in ((0, 0.45 if idx == 2 else 0.30), (1, 0.02)):
+                    stop = Gsk.ColorStop()
+                    stop.offset = offset
+                    stop.color = rgba(color, alpha)
+                    stops.append(stop)
+                snap.append_linear_gradient(Graphene.Rect().init(left, top, pw, ph),
+                                            Graphene.Point().init(0, top), Graphene.Point().init(0, top + ph),
+                                            stops)
+                snap.pop()
                 snap.append_stroke(line.to_path(), stroke, rgba(color))
 
         def _review(self, page, key):
@@ -1546,7 +1660,7 @@ def run_gui(page):
 
         def show_page(self, name):
             sub = None
-            if name in [n for n, _, _ in SETTING_PAGES]:
+            if name in [n for n, *_ in SETTING_PAGES]:
                 sub, name = name, "settings"
             if name not in self.nav_rows:
                 name = "overview"
@@ -1554,16 +1668,16 @@ def run_gui(page):
             self.syncing = True
             try:
                 self.nav.select_row(self.nav_rows[name])
-                if name in TABS:
+                if name in HEADER_TABS:
                     self.tabs.set_active_name(name)
                     self.header.set_title_widget(self.tabs)
                 else:
-                    self.header_title.set_title(dict((n, t) for n, t, _ in PAGES)[name])
+                    self.header_title.set_title(dict((n, t) for n, t, *_ in PAGES)[name])
                     self.header.set_title_widget(self.header_title)
             finally:
                 self.syncing = False
             if name == "settings":
-                self.show_setting(sub or self.set_stack.get_visible_child_name() or "memory")
+                self.show_setting(sub)
             if name == "files" and not self.files_loaded:
                 self.open_folder(self.folder)
             if self.split.get_collapsed():
@@ -1579,8 +1693,7 @@ def run_gui(page):
         def _tick(self):
             if self.get_visible():
                 self.refresh()
-                if self.stack.get_visible_child_name() == "settings" and \
-                        self.set_stack.get_visible_child_name() == "memory" and not self.applying:
+                if self.stack.get_visible_child_name() == "settings" and not self.applying:
                     self.status = swap_status()
                     self._fill_status()
             return True
@@ -1633,7 +1746,7 @@ def run_gui(page):
             self.search.connect("search-changed", lambda *_: self.app_list.invalidate_filter())
             page, body = self._page("Apps", "Everything running as you, grouped by app. "
                                     "End what you do not need; unsaved work in it may be lost.",
-                                    self.search)
+                                    self.search, icon="view-grid-symbolic", color="purple")
             self.app_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
             self.app_list.add_css_class("boxed-list")
             self.app_list.set_sort_func(lambda a, b: (b.mem > a.mem) - (b.mem < a.mem))
@@ -1779,7 +1892,8 @@ def run_gui(page):
 
         def _files(self):
             page, body = self._page("Files in RAM", "Files in /tmp and /dev/shm live in RAM. "
-                                    "Removing the ones you no longer need frees that memory at once.")
+                                    "Removing the ones you no longer need frees that memory at once.",
+                                    icon="folder-symbolic", color="orange")
             bar_ = Gtk.Box(spacing=8)
             self.up_btn = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Up one folder")
             self.up_btn.connect("clicked", lambda *_: self.open_folder(self._parent(self.folder)))
@@ -1917,41 +2031,30 @@ def run_gui(page):
         # ---- settings
 
         def _settings(self):
-            self.set_nav = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
-            self.set_nav.add_css_class("ms-nav")
-            self.set_rows = {}
-            self.set_stack = Gtk.Stack(hexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
-            builders = {"general": self._general, "appearance": self._appearance,
-                        "memory": self._memory, "notifications": self._notifications}
-            for name, title, icon in SETTING_PAGES:
-                row = self._nav_row(title, icon)
-                row.name = name
-                self.set_nav.append(row)
-                self.set_rows[name] = row
-                self.set_stack.add_named(builders[name](), name)
-            self.set_nav.connect("row-selected", lambda _l, r: r and not self.syncing and self.show_setting(r.name))
-            side = Gtk.Box(orientation=V, width_request=230, margin_top=8, margin_start=16, margin_end=12)
-            side.append(label("Settings", "ms-h2", margin_start=12, margin_bottom=10, margin_top=6))
-            side.append(self.set_nav)
-            box = Gtk.Box()
-            box.append(side)
-            line = Gtk.Separator(orientation=V)
-            line.add_css_class("ms-sep")
-            box.append(line)
-            box.append(self.set_stack)
-            self.narrow.append((box, "orientation", V))
-            self.narrow.append((line, "visible", False))
-            return box
+            """Every setting on one page: three small cards on top, Memory Optimization below."""
+            page, body = self._page("Settings", "Customize and optimize your system.",
+                                    icon="emblem-system-symbolic", color="green")
+            self.set_scroll, self.set_body = page, body
+            self.set_sections = {"general": self._general(), "appearance": self._appearance(),
+                                 "notifications": self._notifications()}
+            body.append(self._columns(*self.set_sections.values(), homogeneous=True))
+            self.set_sections["memory"] = self._memory(body)
+            return page
 
-        def show_setting(self, name):
-            self.set_stack.set_visible_child_name(name)
-            self.syncing = True
-            try:
-                self.set_nav.select_row(self.set_rows[name])
-            finally:
-                self.syncing = False
-            if name == "memory" and not self.applying:
+        def show_setting(self, name=None):
+            """Scroll the Settings page to one section (or leave it where it is)."""
+            if not self.applying:
                 self._load_swap()
+            section = self.set_sections.get(name)
+            if not section:
+                return
+
+            def scroll():
+                ok, point = section.compute_point(self.set_body, Graphene.Point())
+                if ok:
+                    self.set_scroll.get_vadjustment().set_value(max(0, point.y - 8))
+                return False
+            GLib.idle_add(scroll)
 
         def _save(self, key, value):
             self.settings[key] = value
@@ -1961,7 +2064,8 @@ def run_gui(page):
                 self.toasts.add_toast(Adw.Toast(title=f"Could not save settings: {e.strerror or e}"))
 
         def _general(self):
-            page, body = self._page("General", "How often Memory Sweep looks again, and where it opens.")
+            box = self._section("emblem-system-symbolic", "blue", "General",
+                                "How often Memory Sweep looks again, and where it opens")
             g = Adw.PreferencesGroup()
             refresh = Adw.ComboRow(title="Refresh every", subtitle="Shorter uses a little more CPU",
                                    model=Gtk.StringList.new([f"{s} seconds" for s in REFRESH_CHOICES]))
@@ -1969,39 +2073,53 @@ def run_gui(page):
                                  if self.settings["refresh"] in REFRESH_CHOICES else 1)
             refresh.connect("notify::selected", lambda r, _: (
                 self._save("refresh", REFRESH_CHOICES[r.get_selected()]), self._restart_timer()))
+            refresh.add_prefix(badge("view-refresh-symbolic", "blue", square=True))
             g.add(refresh)
-            starts = [(n, t) for n, t, _ in PAGES if n in TABS]
+            starts = [(n, t) for n, t, *_ in PAGES if n in TABS]
             start = Adw.ComboRow(title="Open on", model=Gtk.StringList.new([t for _, t in starts]))
             names = [n for n, _ in starts]
             start.set_selected(names.index(self.settings["start_page"])
                                if self.settings["start_page"] in names else 0)
             start.connect("notify::selected", lambda r, _: self._save("start_page", names[r.get_selected()]))
+            start.add_prefix(badge("go-home-symbolic", "green", square=True))
             g.add(start)
-            body.append(g)
-            return page
+            box.append(g)
+            return box
+
+        def _section(self, icon, color, title, subtitle):
+            """A small settings card with a coloured head; append rows to it."""
+            box = card(spacing=14, hexpand=True)
+            box.append(card_head(icon, color, title, subtitle, solid=True)[0])
+            return box
 
         def _appearance(self):
-            page, body = self._page("Appearance", "Pick a theme.")
+            box = self._section("preferences-desktop-appearance-symbolic", "pink", "Appearance",
+                                "Pick a theme")
             g = Adw.PreferencesGroup()
             row = Adw.ActionRow(title="Theme", subtitle="System follows the desktop's light or dark style")
-            themes = Adw.ToggleGroup(valign=CENTER)
+            # Below the row, not beside it: three labels do not fit next to the text in a third
+            # of the page.
+            themes = Adw.ToggleGroup(homogeneous=True, margin_top=12)
             for name, title in (("system", "System"), ("light", "Light"), ("dark", "Dark")):
                 themes.add(Adw.Toggle(name=name, label=title))
             themes.set_active_name(self.settings["theme"])
             themes.connect("notify::active-name", lambda t, _: (
                 self._save("theme", t.get_active_name()), self.app.apply_theme()))
-            row.add_suffix(themes)
+            row.add_prefix(badge("weather-clear-symbolic", "pink", square=True))
             g.add(row)
-            body.append(g)
-            return page
+            g.add(themes)
+            box.append(g)
+            return box
 
         def _notifications(self):
-            page, body = self._page("Notifications", "Get a heads-up before RAM runs out.")
+            box = self._section("preferences-system-notifications-symbolic", "orange", "Notifications",
+                                "Get a heads-up before RAM runs out")
             g = Adw.PreferencesGroup()
             on = Adw.SwitchRow(title="Warn when RAM is almost full",
                                subtitle="At most once every 10 minutes, while Memory Sweep is open",
                                active=self.settings["notify"])
             on.connect("notify::active", lambda r, _: self._save("notify", r.get_active()))
+            on.add_prefix(badge("preferences-system-notifications-symbolic", "orange", square=True))
             g.add(on)
             at = Adw.SpinRow.new_with_range(70, 98, 1)
             at.set_title("Warn at")
@@ -2009,18 +2127,19 @@ def run_gui(page):
             at.set_value(self.settings["notify_at"])
             at.connect("notify::value", lambda r, _: self._save("notify_at", int(r.get_value())))
             on.bind_property("active", at, "sensitive", GObject.BindingFlags.SYNC_CREATE)
+            at.add_prefix(badge("ms-gauge-symbolic", "red", square=True))
             g.add(at)
-            body.append(g)
-            return page
+            box.append(g)
+            return box
 
         # ---- memory optimization
 
-        def _option(self, parent, title, subtitle, control, below=None, first=False):
-            """One setting in the Swap and zram card; returns its subtitle label."""
-            if not first:
-                parent.append(sep())
-            row = Gtk.Box(orientation=V, spacing=8, margin_top=14, margin_bottom=14)
-            top = Gtk.Box(spacing=16)
+        def _option(self, parent, title, subtitle, control, below=None, icon=None, color="blue"):
+            """One setting as a sub-card with a tinted icon tile; returns its subtitle label."""
+            row = Gtk.Box(orientation=V, spacing=10, css_classes=["ms-row"])
+            top = Gtk.Box(spacing=14)
+            if icon:
+                top.append(badge(icon, color, square=True))
             names = Gtk.Box(orientation=V, spacing=2, hexpand=True, valign=CENTER)
             names.append(label(title, "ms-strong"))
             sub = label(subtitle, "ms-dim", "ms-small", wrap=True)
@@ -2037,80 +2156,88 @@ def run_gui(page):
 
         def _slider(self, lower, upper, step, page_step, marks):
             adj = Gtk.Adjustment(lower=lower, upper=upper, step_increment=step, page_increment=page_step)
-            spin = Gtk.SpinButton(adjustment=adj, numeric=True, width_chars=4)
-            scale = Gtk.Scale(adjustment=adj, draw_value=False, hexpand=True, round_digits=0)
+            spin = Gtk.SpinButton(adjustment=adj, numeric=True, width_chars=4, css_classes=["ms-spin"])
+            scale = Gtk.Scale(adjustment=adj, draw_value=False, hexpand=True, round_digits=0,
+                              css_classes=["ms-scale"])
             for value, text in marks:
                 scale.add_mark(value, Gtk.PositionType.BOTTOM, text)
             adj.connect("value-changed", lambda *_: self._form_changed())
             return adj, spin, scale
 
-        def _memory(self):
-            page, body = self._page("Memory Optimization",
-                                    "Set up zram, swap and zswap so your RAM goes further.")
+        def _memory(self, page_body):
+            """Memory Optimization, appended to the Settings page; returns its first widget."""
+            body = Gtk.Box(orientation=V, spacing=22, margin_top=10)
+            head = Gtk.Box(spacing=14)
+            head.append(badge("ms-ram-symbolic", "purple", solid=True, square=True))
+            names = Gtk.Box(orientation=V, spacing=2, hexpand=True, valign=CENTER)
+            names.append(label("Memory Optimization", "ms-h2"))
+            names.append(label("Set up zram, swap and zswap so your RAM goes further.", "ms-dim", "ms-small",
+                               wrap=True))
+            head.append(names)
+            body.append(head)
+            page_body.append(body)
             banner = Gtk.Box(spacing=14)
             banner.add_css_class("ms-banner")
-            banner.append(badge("dialog-information-symbolic", "blue", small=True))
+            banner.append(badge("dialog-information-symbolic", "blue", solid=True))
             texts = Gtk.Box(orientation=V, spacing=2, hexpand=True, valign=CENTER)
-            texts.append(label("About zram, swap and zswap", "ms-strong"))
+            texts.append(label("About zram, swap and zswap", "ms-strong", "ms-tint", "blue"))
             texts.append(label("zram keeps swap in RAM, compressed, so it stays fast. A swap file on disk "
                                "catches what does not fit. zswap compresses pages on their way to the swap "
                                "file; next to zram it adds little.", "ms-dim", "ms-small", wrap=True))
             banner.append(texts)
-            banner.append(link("Learn more", lambda: open_uri(self, ZRAM_DOCS)))
+            learn = icon_button("adw-external-link-symbolic", "Learn more", "ms-outline")
+            learn.connect("clicked", lambda *_: open_uri(self, ZRAM_DOCS))
+            banner.append(learn)
             body.append(banner)
 
-            left = card(spacing=0, hexpand=True)
-            left.append(label("Swap and zram", "ms-h2", margin_bottom=4))
+            left = card(spacing=12, hexpand=True)
+            head, _ = card_head("ms-ram-symbolic", "purple", "Swap and zram",
+                                "Configure zram (compressed RAM) and disk swap settings", solid=True)
+            head.set_margin_bottom(4)
+            left.append(head)
             self.zram_adj, spin, scale = self._slider(
                 0, 150, 5, 25, ((0, "Off"), (50, "50%"), (100, "100%"), (150, "150%")))
             self.zram_widgets = [spin, scale]
-            self.zram_sub = self._option(left, "zram size", "", spin, scale, first=True)
+            self.zram_sub = self._option(left, "zram size", "", spin, scale, "ms-ram-symbolic", "blue")
             self.algo = Gtk.DropDown.new_from_strings(
                 ["lz4 (fastest)", "zstd (packs the most)", "lzo-rle (balanced)"])
             self.algo.connect("notify::selected", lambda *_: self._form_changed())
             self.zram_widgets.append(self.algo)
             self._option(left, "Compression", "How zram packs pages. zstd fits the most in RAM; "
-                         "lz4 is the quickest.", self.algo)
+                         "lz4 is the quickest.", self.algo, None, "ms-zram-symbolic", "purple")
             self.file_adj, spin, scale = self._slider(
                 1, 64, 1, 4, ((1, "1"), (16, "16"), (32, "32"), (48, "48"), (64, "64 GB")))
-            self.file_sub = self._option(left, "Swap file (GB)", "", spin, scale)
+            self.file_sub = self._option(left, "Swap file (GB)", "", spin, scale,
+                                         "drive-harddisk-symbolic", "cyan")
             self.zswap_sw = Gtk.Switch()
             self.zswap_sw.connect("notify::active", lambda *_: self._form_changed())
-            self.zswap_sub = self._option(left, "zswap", "", self.zswap_sw)
+            self.zswap_sub = self._option(left, "zswap", "", self.zswap_sw, None, "ms-swap-symbolic", "teal")
             tools = Gtk.Box(spacing=8, halign=Gtk.Align.START)
             self.tools_state = label("", "ms-pill", valign=CENTER)
             tools.append(self.tools_state)
             self.tool_btns = {}
-            for action, text in (("install", "Install"), ("reinstall", "Reinstall"), ("remove", "Remove")):
-                b = Gtk.Button(label=text)
+            for action, text, icon in (("install", "Install", "folder-download-symbolic"),
+                                       ("reinstall", "Reinstall", "view-refresh-symbolic"),
+                                       ("remove", "Remove", "user-trash-symbolic")):
+                b = icon_button(icon, text)
                 b.connect("clicked", lambda *_, a=action: self._pick_tools(a))
                 tools.append(b)
                 self.tool_btns[action] = b
             self._option(left, "Install and remove tools",
-                         "zram-tools sets up zram at every start; zram needs it.", None, tools)
-            left.append(sep())
-            adv = Gtk.Expander(margin_top=14)
-            adv.set_label_widget(label("Advanced options", "ms-strong"))
-            adv_box = Gtk.Box(orientation=V)
-            self.swappiness_adj, spin, scale = self._slider(
-                0, 200, 5, 20, ((0, "0"), (60, "60"), (100, "100"), (200, "200")))
-            self._option(adv_box, "Swappiness", "How early the kernel moves idle pages to swap. "
-                         "60 is the usual default; 100 to 180 suits zram.", spin, scale, first=True)
-            self.cache_adj, spin, scale = self._slider(
-                1, 500, 10, 50, ((1, "1"), (100, "100"), (500, "500")))
-            self._option(adv_box, "Cache pressure", "How quickly the kernel drops cached file and "
-                         "folder names. 100 is the default.", spin, scale)
-            adv.set_child(adv_box)
-            left.append(adv)
+                         "zram-tools sets up zram at every start; zram needs it.", None, tools,
+                         "applications-engineering-symbolic", "pink")
 
-            right = Gtk.Box(orientation=V, spacing=16, width_request=340)
-            status = card(spacing=14)
-            status.append(label("Current status", "ms-h2"))
-            self.status_box = Gtk.Box(orientation=V, spacing=14)
+            right = Gtk.Box(orientation=V, spacing=16, width_request=360)
+            status = card(spacing=12)
+            head, _ = card_head("ms-chart-symbolic", "green", "Current status", solid=True)
+            status.append(head)
+            self.status_box = Gtk.Box(orientation=V, spacing=10)
             status.append(self.status_box)
             right.append(status)
+
             actions = card(spacing=14)
-            actions.append(label("Actions", "ms-h2"))
+            head, _ = card_head("media-playback-start-symbolic", "orange", "Actions", solid=True)
+            actions.append(head)
             warn = Gtk.Box(spacing=10)
             warn.add_css_class("ms-warn")
             warn.append(Gtk.Image(icon_name="dialog-warning-symbolic", valign=Gtk.Align.START))
@@ -2120,27 +2247,58 @@ def run_gui(page):
             self.pending_label = label("", "ms-dim", wrap=True)
             actions.append(self.pending_label)
             buttons = Gtk.Box(spacing=10)
-            reset = Gtk.Button(label="Reset to defaults", hexpand=True)
+            reset = icon_button("edit-undo-symbolic", "Reset to defaults", "ms-ghost")
+            reset.set_hexpand(True)
             reset.connect("clicked", lambda *_: self._reset_form())
             buttons.append(reset)
-            self.apply_btn = Gtk.Button(hexpand=True)
-            self.apply_btn.add_css_class("suggested-action")
+            self.apply_btn = Gtk.Button(hexpand=True, css_classes=["ms-primary"])
             inner = Gtk.Box(spacing=8, halign=CENTER)
             self.apply_spinner = Adw.Spinner(visible=False)
             inner.append(self.apply_spinner)
-            inner.append(Gtk.Label(label="Apply changes"))
+            inner.append(Gtk.Image(icon_name="ms-shield-symbolic"))
+            inner.append(Gtk.Label(label="Apply changes (sudo)"))
             self.apply_btn.set_child(inner)
             self.apply_btn.connect("clicked", lambda *_: self._apply_swap())
             buttons.append(self.apply_btn)
             actions.append(buttons)
             right.append(actions)
+
+            adv = card(spacing=0)
+            adv_head = Gtk.Box(spacing=12)
+            adv_head.append(badge("emblem-system-symbolic", "blue", square=True))
+            names = Gtk.Box(orientation=V, spacing=2, hexpand=True, valign=CENTER)
+            names.append(label("Advanced options", "ms-strong"))
+            names.append(label("Swappiness and cache pressure", "ms-dim", "ms-small"))
+            adv_head.append(names)
+            chevron = Gtk.Image(icon_name="go-next-symbolic", valign=CENTER)
+            adv_head.append(chevron)
+            adv.append(adv_head)
+            adv_box = Gtk.Box(orientation=V, spacing=10, margin_top=14)
+            self.swappiness_adj, spin, scale = self._slider(
+                0, 200, 5, 20, ((0, "0"), (60, "60"), (100, "100"), (200, "200")))
+            self._option(adv_box, "Swappiness", "How early the kernel moves idle pages to swap. "
+                         "60 is the usual default; 100 to 180 suits zram.", spin, scale)
+            self.cache_adj, spin, scale = self._slider(
+                1, 500, 10, 50, ((1, "1"), (100, "100"), (500, "500")))
+            self._option(adv_box, "Cache pressure", "How quickly the kernel drops cached file and "
+                         "folder names. 100 is the default.", spin, scale)
+            self.adv = Gtk.Revealer(child=adv_box, transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
+            adv.append(self.adv)
+
+            def toggle_adv():
+                self.adv.set_reveal_child(not self.adv.get_reveal_child())
+                chevron.set_from_icon_name("go-down-symbolic" if self.adv.get_reveal_child()
+                                           else "go-next-symbolic")
+            clickable(adv_head, toggle_adv)
+            right.append(adv)
             # The form needs more room than the other two-column parts, so it stacks sooner.
             cols = Gtk.Box(spacing=16)
             cols.append(left)
             cols.append(right)
             self.narrow_large.append((cols, "orientation", V))
+            self.narrow_large.append((right, "width-request", -1))
             body.append(cols)
-            return page
+            return body
 
         def _load_swap(self):
             self.status = swap_status()
@@ -2198,14 +2356,14 @@ def run_gui(page):
             self.apply_btn.set_sensitive(bool(self.pending) and not self.applying)
             installed = st["tools"]
             pill(self.tools_state, "green" if installed else "dim",
-                 "zram-tools installed" if installed else "zram-tools not installed")
+                 "✓  zram-tools installed" if installed else "zram-tools not installed")
             self.tool_btns["install"].set_visible(not installed)
             self.tool_btns["reinstall"].set_visible(installed)
             self.tool_btns["remove"].set_visible(installed)
             for action, b in self.tool_btns.items():
                 chosen = f["tools"] == action
-                b.set_css_classes((["destructive-action"] if action == "remove" else ["suggested-action"])
-                                  if chosen else [])
+                b.set_css_classes(["ms-soft", "red" if action == "remove" else "green"] if chosen
+                                  else ["ms-outline"])
             usable = (installed or f["tools"] in ("install", "reinstall")) and f["tools"] != "remove"
             for w in self.zram_widgets:
                 w.set_sensitive(usable)
@@ -2233,43 +2391,52 @@ def run_gui(page):
             while (child := box.get_first_child()):
                 box.remove(child)
 
-            def line(title, value, color=None, frac=None, note=None):
-                item = Gtk.Box(orientation=V, spacing=6)
-                top = Gtk.Box()
-                top.append(label(title, "ms-strong", hexpand=True))
-                v = label(value, "ms-num", xalign=1)
-                if color and frac is None:
-                    v.set_css_classes(["ms-pill", color])
-                top.append(v)
-                item.append(top)
-                if frac is not None:
-                    pb = bar(color, thin=True)
-                    pb.set_fraction(max(0, min(1, frac)))
-                    item.append(pb)
+            def line(icon, color, title, note, value=None, frac=None, on=None):
+                item = Gtk.Box(spacing=12, css_classes=["ms-row"])
+                item.append(badge(icon, color if on is not False else "dim", square=True))
+                names = Gtk.Box(orientation=V, spacing=2, hexpand=True, valign=CENTER)
+                names.append(label(title, "ms-strong"))
                 if note:
-                    item.append(label(note, "ms-dim", "ms-small", wrap=True))
+                    names.append(label(note, "ms-dim", "ms-small", wrap=True))
+                item.append(names)
+                if frac is not None:
+                    end = Gtk.Box(spacing=8, valign=CENTER)
+                    pb = bar(color, thin=True)
+                    pb.set_size_request(80, -1)
+                    pb.set_fraction(max(0, min(1, frac)))
+                    end.append(pb)
+                    end.append(label(f"{100 * frac:.0f}%", "ms-num", "ms-strong", xalign=1, width_chars=4))
+                    item.append(end)
+                elif on is not None:
+                    item.append(label("●  Active" if on else "Off", "ms-pill", "green" if on else "dim",
+                                      valign=CENTER))
+                elif value:
+                    item.append(label(value, "ms-pill", color, "ms-num", valign=CENTER))
                 box.append(item)
 
             if st["zram_on"]:
                 ratio = f", {st['zram_stored'] / st['zram_ram']:.1f}× packed" if st["zram_ram"] else ""
-                line("zram", f"{fmt_size(st['zram_size'])} · {st['algo']}", "green",
-                     st["zram_used"] / st["zram_size"] if st["zram_size"] else 0,
-                     f"{fmt_size(st['zram_used'])} used{ratio}")
+                line("ms-zram-symbolic", "green", "zram",
+                     f"{fmt_size(st['zram_used'])} of {fmt_size(st['zram_size'])} · {st['algo']}{ratio}",
+                     frac=st["zram_used"] / st["zram_size"] if st["zram_size"] else 0)
             else:
-                line("zram", "Off", "dim")
+                line("ms-zram-symbolic", "green", "zram", "Not set up", on=False)
             if st["file_active"]:
-                line("Swap file", fmt_size(st["file_size"]), "purple",
-                     st["file_used"] / st["file_size"] if st["file_size"] else 0,
-                     f"{st['file']} · {fmt_size(st['file_used'])} used")
+                line("drive-harddisk-symbolic", "purple", "Swap file",
+                     f"{st['file']} · {fmt_size(st['file_used'])} of {fmt_size(st['file_size'])}",
+                     frac=st["file_used"] / st["file_size"] if st["file_size"] else 0)
             else:
-                line("Swap file", "Off", "dim", note=st["file"])
+                line("drive-harddisk-symbolic", "purple", "Swap file", st["file"] or "None", on=False)
             if st["zswap"] is None:
-                line("zswap", "Not in kernel", "dim")
+                line("ms-swap-symbolic", "teal", "zswap", "Not in this kernel", on=False)
             else:
-                line("zswap", f"On · {st['zswap_compressor']}" if st["zswap"] else "Off",
-                     "green" if st["zswap"] else "dim")
-            line("Swappiness", str(st["swappiness"]))
-            line("Cache pressure", str(st["cache_pressure"]))
+                line("ms-swap-symbolic", "teal", "zswap",
+                     f"Compressor {st['zswap_compressor']}" if st["zswap"] else "Not in use",
+                     on=bool(st["zswap"]))
+            line("ms-gauge-symbolic", "orange", "Swappiness", "How eagerly pages go to swap",
+                 str(st["swappiness"]))
+            line("ms-gauge-symbolic", "pink", "Cache pressure", "How fast name caches are dropped",
+                 str(st["cache_pressure"]))
 
         def _apply_swap(self):
             args = list(self.pending)
@@ -2310,8 +2477,9 @@ def run_gui(page):
         # ---- about
 
         def _about(self):
-            page, body = self._page("About", "Who made Memory Sweep, and how.")
-            hero = card(spacing=16, vertical=False)
+            page, body = self._page("About", "Who made Memory Sweep, and how.", icon="help-about-symbolic",
+                                    color="cyan")
+            hero = card(spacing=16, vertical=False, color="cyan")
             hero.append(Gtk.Image(icon_name=APP_ID, pixel_size=96))
             texts = Gtk.Box(orientation=V, spacing=4, valign=CENTER, hexpand=True)
             texts.append(label(APP_NAME, "ms-h1"))
@@ -2320,20 +2488,20 @@ def run_gui(page):
                                "and zswap so your RAM goes further.", wrap=True))
             texts.append(label(f"Developed by {AUTHOR}", "ms-dim", "ms-small"))
             hero.append(texts)
-            more = Gtk.Button(label="Credits and license", valign=CENTER)
+            more = Gtk.Button(label="Credits and license", valign=CENTER, css_classes=["ms-outline"])
             more.connect("clicked", lambda *_: self.app.activate_action("about", None))
             hero.append(more)
             body.append(hero)
-            safety = card(spacing=8)
-            safety.append(label("What it never touches", "ms-h2"))
+            safety = card(spacing=10, color="green")
+            safety.append(card_head("ms-shield-symbolic", "green", "What it never touches", solid=True)[0])
             safety.append(label(
                 "It ends only your own processes, never the parts of the desktop session, and checks "
                 "each process again just before it signals it. It removes only your own files in /tmp "
                 "and /dev/shm. Swap changes run through a small helper that asks for your password and "
                 "changes nothing else.", "ms-dim", wrap=True))
             body.append(safety)
-            ai = card(spacing=8)
-            ai.append(label("AI statement", "ms-h2"))
+            ai = card(spacing=10, color="purple")
+            ai.append(card_head("ms-bulb-symbolic", "purple", "AI statement", solid=True)[0])
             ai.append(label(AI_STATEMENT, "ms-dim", wrap=True))
             body.append(ai)
             return page
@@ -2374,7 +2542,7 @@ def run_gui(page):
             if self.css:
                 Gtk.StyleContext.remove_provider_for_display(display, self.css)
             self.css = Gtk.CssProvider()
-            self.css.load_from_string(CSS.substitute(self.palette))
+            self.css.load_from_string(CSS.substitute(self.palette) + color_css())
             Gtk.StyleContext.add_provider_for_display(display, self.css,
                                                       Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             win = self.get_active_window()
