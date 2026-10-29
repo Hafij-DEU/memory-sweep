@@ -27,7 +27,7 @@ AI_STATEMENT = (
     "acceptance criteria in natural language. An AI coding agent (Claude Code, Anthropic, model "
     "Claude Opus) then inspected the system, wrote the code and tests, ran them, and fixed defects. "
     "The author reviewed the results and gave follow-up instructions.")
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 PROC = "/proc"
 UID = os.getuid()
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -1202,6 +1202,23 @@ def run_gui(page):
                         break
             return self.cache[key]
 
+    class CardBin(Adw.BreakpointBin):
+        """A breakpoint bin that is never shorter than its card and does not clip the card's shadow.
+        A plain bin's minimum height is only height_request, and a scrolled page hands out minimum
+        heights, so the bottom of a taller card was cut off."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.set_overflow(Gtk.Overflow.VISIBLE)
+
+        def do_measure(self, orientation, for_size):
+            mn, nat, mb, nb = Adw.BreakpointBin.do_measure(self, orientation, for_size)
+            child = self.get_child()
+            if orientation == Gtk.Orientation.VERTICAL and child:
+                mn = max(mn, child.measure(orientation, for_size)[0])
+                nat = max(nat, mn)
+            return mn, nat, mb, nb
+
     class StatCard(Gtk.Box):
         """Overview card: solid icon, title, value and percent, a bar and up to four detail cells.
 
@@ -1242,7 +1259,7 @@ def run_gui(page):
 
         def bin(self):
             """The card in a bin that switches it to compact below COMPACT_WIDTH of its own width."""
-            b = Adw.BreakpointBin(child=self, width_request=230, height_request=170)
+            b = CardBin(child=self, width_request=230, height_request=150)
             bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse(f"max-width: {self.COMPACT_WIDTH}px"))
             bp.connect("apply", lambda *_: self._set_compact(True))
             bp.connect("unapply", lambda *_: self._set_compact(False))
