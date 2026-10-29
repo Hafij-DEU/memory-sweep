@@ -27,7 +27,7 @@ AI_STATEMENT = (
     "acceptance criteria in natural language. An AI coding agent (Claude Code, Anthropic, model "
     "Claude Opus) then inspected the system, wrote the code and tests, ran them, and fixed defects. "
     "The author reviewed the results and gave follow-up instructions.")
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROC = "/proc"
 UID = os.getuid()
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -1000,6 +1000,9 @@ toggle-group.ms-tabs > toggle:active, toggle-group.ms-tabs > toggle:checked {
 .ms-icon { border-radius: 999px; min-width: 40px; min-height: 40px; }
 .ms-icon.small { min-width: 34px; min-height: 34px; }
 .ms-icon.big { min-width: 50px; min-height: 50px; }
+.ms-compact .ms-icon.big { min-width: 40px; min-height: 40px; }
+.ms-card.ms-compact { padding: 14px; }
+.ms-compact .ms-value { font-size: 14pt; }
 .ms-icon.square { border-radius: 12px; }
 progressbar.ms-bar > trough { min-height: 10px; min-width: 40px; border-radius: 99px; background: $track; }
 progressbar.ms-bar > trough > progress { min-height: 10px; border-radius: 99px; }
@@ -1200,16 +1203,25 @@ def run_gui(page):
             return self.cache[key]
 
     class StatCard(Gtk.Box):
-        """Overview card: solid icon, title, value and percent, a bar and up to four detail cells."""
+        """Overview card: solid icon, title, value and percent, a bar and up to four detail cells.
 
-        def __init__(self, title, icon, color, on_click=None):
-            super().__init__(orientation=V, spacing=14, width_request=230)
+        Below COMPACT_WIDTH it switches to a short title, drops " / total" from the value, uses a
+        smaller value font and puts the cells in one column, so nothing is cut to "…"."""
+
+        COMPACT_WIDTH = 300
+
+        def __init__(self, title, icon, color, on_click=None, short=None):
+            super().__init__(orientation=V, spacing=14)
             self.add_css_class("ms-card")
             self.add_css_class(color)
+            self.titles = (title, short or title)
+            self.compact = False
+            self.data = None
             top = Gtk.Box(spacing=14)
             top.append(badge(icon, color, solid=True, big=True))
             names = Gtk.Box(orientation=V, spacing=2, valign=CENTER, hexpand=True)
-            names.append(label(title, "ms-dim", "ms-strong", ellipsize=Pango.EllipsizeMode.END))
+            self.title = label(title, "ms-dim", "ms-strong", ellipsize=Pango.EllipsizeMode.END)
+            names.append(self.title)
             self.value = label("", "ms-value", ellipsize=Pango.EllipsizeMode.END)
             names.append(self.value)
             top.append(names)
@@ -1220,24 +1232,59 @@ def run_gui(page):
             self.append(top)
             self.bar = bar(color)
             self.append(self.bar)
-            grid = Gtk.Grid(column_spacing=8, row_spacing=4, column_homogeneous=True)
+            self.grid = Gtk.Grid(column_spacing=8, row_spacing=4, column_homogeneous=True)
             self.cells = []
             for i in range(4):
-                c = label("", "ms-dim", "ms-small", "ms-num", xalign=i % 2,
-                          ellipsize=Pango.EllipsizeMode.END)
-                grid.attach(c, i % 2, i // 2, 1, 1)
+                c = label("", "ms-dim", "ms-small", "ms-num", ellipsize=Pango.EllipsizeMode.END)
                 self.cells.append(c)
-            self.append(grid)
+            self._place_cells()
+            self.append(self.grid)
+
+        def bin(self):
+            """The card in a bin that switches it to compact below COMPACT_WIDTH of its own width."""
+            b = Adw.BreakpointBin(child=self, width_request=230, height_request=170)
+            bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse(f"max-width: {self.COMPACT_WIDTH}px"))
+            bp.connect("apply", lambda *_: self._set_compact(True))
+            bp.connect("unapply", lambda *_: self._set_compact(False))
+            b.add_breakpoint(bp)
+            return b
+
+        def _set_compact(self, on):
+            self.compact = on
+            # Changing text inside the breakpoint switch would need another layout pass right now.
+            GLib.idle_add(self._apply_mode)
+
+        def _apply_mode(self):
+            (self.add_css_class if self.compact else self.remove_css_class)("ms-compact")
+            self.title.set_label(self.titles[self.compact])
+            self._place_cells()
+            if self.data:
+                self.update(*self.data)
+            return GLib.SOURCE_REMOVE
+
+        def _place_cells(self):
+            """Two columns, or one when compact (empty cells then take no room)."""
+            for c in self.cells:
+                if c.get_parent():
+                    self.grid.remove(c)
+            for i, c in enumerate(self.cells):
+                col, row = (0, i) if self.compact else (i % 2, i // 2)
+                c.set_xalign(0 if self.compact else i % 2)
+                self.grid.attach(c, col, row, 1, 1)
 
         def update(self, value, pct, fraction, cells):
-            # "used / total": the total smaller and dimmer, so the value fits narrow cards.
+            self.data = (value, pct, fraction, cells)
+            # "used / total": the total smaller and dimmer; left out when compact (the cells
+            # repeat it).
             used, sep_, total = value.partition(" / ")
             self.value.set_markup(GLib.markup_escape_text(used) + (
-                f"<span size='72%' alpha='65%'> / {GLib.markup_escape_text(total)}</span>" if sep_ else ""))
+                f"<span size='72%' alpha='65%'> / {GLib.markup_escape_text(total)}</span>"
+                if sep_ and not self.compact else ""))
             self.pct.set_label(pct)
             self.bar.set_fraction(max(0, min(1, fraction)))
             for lbl, v in zip(self.cells, list(cells) + [""] * 4):
                 lbl.set_label(v)
+                lbl.set_visible(bool(v) or not self.compact)
 
     class Window(Adw.ApplicationWindow):
         def __init__(self, app):
@@ -1396,13 +1443,13 @@ def run_gui(page):
             self.swap_card = StatCard("Swap", "ms-swap-symbolic", "purple",
                                       on_click=lambda: self.show_page("memory"))
             self.zram_card = StatCard("Compressed (zram)", "ms-zram-symbolic", "green",
-                                      on_click=lambda: self.show_page("memory"))
+                                      on_click=lambda: self.show_page("memory"), short="zram")
             self.files_card = StatCard("Files held in RAM", "folder-symbolic", "orange",
-                                       on_click=lambda: self.show_page("files"))
+                                       on_click=lambda: self.show_page("files"), short="RAM files")
             for pair in ((self.ram_card, self.swap_card), (self.zram_card, self.files_card)):
                 box = Gtk.Box(spacing=16, homogeneous=True)
                 for c in pair:
-                    box.append(c)
+                    box.append(c.bin())
                 cards.append(box)
             body.append(cards)
 
