@@ -278,3 +278,15 @@ def test_helper_refuses_bad_arguments(args):
     # Each of these fails its check before the helper touches anything, so it is safe unprivileged.
     helper = os.path.join(HERE, "..", "src", "memory-sweep-swap")
     assert subprocess.run(["/bin/sh", helper, *args], capture_output=True).returncode == 2
+
+
+def test_notification_methods_exist():
+    # _notify runs from a GLib idle callback, so a bad method name only surfaces as an
+    # apport "crash" report while the app keeps running
+    import re
+    from gi.repository import Gio
+    src = open(_loader.path).read()
+    body = src[src.index("def _notify("):]
+    body = body[:body.index("\n        def ", 1)]
+    calls = set(re.findall(r"\bn\.(\w+)\(", body))
+    assert calls and all(hasattr(Gio.Notification, c) for c in calls), calls

@@ -27,7 +27,7 @@ AI_STATEMENT = (
     "acceptance criteria in natural language. An AI coding agent (Claude Code, Anthropic, model "
     "Claude Opus) then inspected the system, wrote the code and tests, ran them, and fixed defects. "
     "The author reviewed the results and gave follow-up instructions.")
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 PROC = "/proc"
 UID = os.getuid()
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -1800,7 +1800,7 @@ def run_gui(page):
             if snap.groups:
                 body += f" {snap.groups[0].title} uses the most: {fmt_size(snap.groups[0].mem)}."
             n.set_body(body)
-            n.set_default_action_and_target_value("app.show-page", GLib.Variant("s", "apps"))
+            n.set_default_action_and_target("app.show-page", GLib.Variant("s", "apps"))
             self.app.send_notification("ram-high", n)
 
         # ---- apps
