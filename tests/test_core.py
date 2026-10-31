@@ -290,3 +290,147 @@ def test_notification_methods_exist():
     body = body[:body.index("\n        def ", 1)]
     calls = set(re.findall(r"\bn\.(\w+)\(", body))
     assert calls and all(hasattr(Gio.Notification, c) for c in calls), calls
+
+
+MESH = "/opt/MeshDrop/meshdrop-desktop"
+
+
+def meshdrop_tree():
+    """MeshDrop as seen on 2026-10-31: the main process plus a second full copy
+    (the clipboard helper) with its own zygote, GPU and network processes. Chromium
+    rewrites its title, so each argv is one string."""
+    def m(pid, ppid, args="", ram=1 << 20):
+        return proc(pid, ppid, MESH, [f"{MESH} {args}".strip()], comm="meshdrop-deskto", ram=ram)
+    return [
+        proc(50, 1, "/usr/lib/systemd/systemd", ["/usr/lib/systemd/systemd", "--user"]),
+        m(100, 50, ram=68 << 20),
+        m(101, 100, "--type=zygote --no-zygote-sandbox"),
+        m(102, 101, "--type=gpu-process --ozone-platform=wayland", ram=35 << 20),
+        m(103, 100, "--type=zygote"),
+        m(104, 103, "--type=renderer", ram=53 << 20),
+        m(105, 100, "--type=utility --utility-sub-type=network.mojom.NetworkService"),
+        proc(106, 100, "/usr/bin/python3.14", ["python3", "/opt/MeshDrop/resources/meshdrop-bt.py"]),
+        m(110, 100, "--password-store=basic", ram=28 << 20),
+        m(111, 110, "--type=zygote --no-zygote-sandbox"),
+        m(112, 111, "--type=gpu-process", ram=10 << 20),
+        m(113, 112, "--type=broker"),
+        m(114, 110, "--type=zygote"),
+        m(115, 110, "--type=utility --utility-sub-type=network.mojom.NetworkService", ram=7 << 20),
+    ]
+
+
+def test_extra_copy_found_for_meshdrop():
+    groups = {g.key: g for g in ms.build_groups(meshdrop_tree())}
+    mesh = groups["meshdrop-desktop"]
+    assert mesh.title == "MeshDrop"
+    [extra] = mesh.extras
+    assert extra.root.pid == 110  # the clipboard helper, never the main process 100
+    assert sorted(p.pid for p in extra.tree) == [110, 111, 112, 113, 114, 115]
+    assert extra.ram == (28 + 1 + 10 + 1 + 1 + 7) << 20
+    assert "clipboard" in mesh.extra_note
+    # the launcher that started MeshDrop sees no extra copy of its own
+    assert groups["systemd"].extras == []
+
+
+def test_extra_copy_not_found_elsewhere():
+    brave = [proc(10, 1, "/opt/brave/brave", ["/opt/brave/brave"]),
+             proc(11, 10, "/opt/brave/brave", ["/opt/brave/brave --type=renderer"]),
+             proc(12, 10, "/opt/brave/brave", ["/opt/brave/brave --type=gpu-process"])]
+    # a shell starting a shell, a Python pool: same program, but no Chromium helpers
+    shells = [proc(20, 1, "/bin/bash", ["bash"]), proc(21, 20, "/bin/bash", ["bash"]),
+              proc(22, 21, "/bin/bash", ["bash"])]
+    pool = [proc(30, 1, "/usr/bin/python3", ["python3", "/x/job.py"]),
+            proc(31, 30, "/usr/bin/python3", ["python3", "/x/job.py"])]
+    # a second main process under a helper (not under the main process) is left alone
+    odd = [proc(40, 1, "/opt/x/x", ["/opt/x/x"]), proc(41, 40, "/opt/x/x", ["/opt/x/x --type=utility"]),
+           proc(42, 41, "/opt/x/x", ["/opt/x/x"]), proc(43, 42, "/opt/x/x", ["/opt/x/x --type=gpu-process"])]
+    for g in ms.build_groups(brave + shells + pool + odd):
+        assert g.extras == [], g.key
+
+
+def test_extra_copy_inside_extra_copy_counted_once():
+    tree = meshdrop_tree() + [
+        proc(120, 110, MESH, [f"{MESH} --nested"]),
+        proc(121, 120, MESH, [f"{MESH} --type=zygote"])]
+    [mesh] = [g for g in ms.build_groups(tree) if g.key == "meshdrop-desktop"]
+    [extra] = mesh.extras
+    assert extra.root.pid == 110 and {120, 121} <= {p.pid for p in extra.tree}
+
+
+def test_extra_copy_locks():
+    other = [proc(p.pid, p.ppid, p.exe, p.argv, uid=ms.UID + 1) for p in meshdrop_tree()]
+    [mesh] = [g for g in ms.build_groups(other) if g.key == "meshdrop-desktop"]
+    assert ms.instance_locked(mesh.extras[0]) == "Runs as another user"
+    [mesh] = [g for g in ms.build_groups(meshdrop_tree()) if g.key == "meshdrop-desktop"]
+    assert ms.instance_locked(mesh.extras[0], keep=frozenset({113})) == "Memory Sweep was started from this app"
+    assert ms.instance_locked(mesh.extras[0]) is None
+
+
+def test_extra_copy_tip(monkeypatch):
+    monkeypatch.setattr(ms, "scan_procs", meshdrop_tree)
+    snap = ms.Snapshot()
+    [tip] = [t for t in snap.tips() if t[0] == "extra"]
+    assert tip[2:] == ("apps", "meshdrop-desktop") and "MeshDrop" in tip[1] and "48 MB" in tip[1]
+    # the tip needs a copy worth ending
+    small = meshdrop_tree()
+    for p in small:
+        if p.pid >= 110:
+            p.ram = 1 << 20
+    monkeypatch.setattr(ms, "scan_procs", lambda: small)
+    assert not [t for t in ms.Snapshot().tips() if t[0] == "extra"]
+
+
+PROBE = r'''
+import subprocess, sys, time
+role = sys.argv[1]
+def spawn(*args):
+    return subprocess.Popen([sys.executable, __file__, *args])
+if role == "main":
+    spawn("--type=gpu-process"); spawn("--type=utility"); spawn("--password-store=basic")
+elif role == "--password-store=basic":
+    spawn("--type=zygote"); spawn("--type=gpu-process")
+time.sleep(300)
+'''
+
+
+@pytest.fixture
+def electron_probe(tmp_path):
+    """A fake Electron app made of real processes: a main process with helpers and a
+    second full copy with its own helpers. Copy python3 under a unique name."""
+    exe = tmp_path / "ms-electron-probe"
+    shutil.copy(os.path.realpath(sys.executable), exe)
+    script = tmp_path / "probe.py"
+    script.write_text(PROBE)
+    main = subprocess.Popen([str(exe), str(script), "main"])
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        g = next((g for g in ms.build_groups(ms.scan_procs()) if g.key == "ms-electron-probe"), None)
+        if g and len(g.procs) == 6:
+            break
+        time.sleep(0.2)
+    yield main
+    for p in ms.scan_procs():
+        if p.exe == str(exe):
+            os.kill(p.pid, signal.SIGKILL)
+    main.wait(timeout=5)
+
+
+def test_stop_extra_copy_keeps_main(electron_probe):
+    [g] = [g for g in ms.build_groups(ms.scan_procs()) if g.key == "ms-electron-probe"]
+    [extra] = g.extras
+    assert extra.root.ppid == electron_probe.pid and len(extra.tree) == 3
+    assert ms.stop([extra], wait=3) == []
+    [g] = [g for g in ms.build_groups(ms.scan_procs()) if g.key == "ms-electron-probe"]
+    assert electron_probe.poll() is None
+    assert len(g.procs) == 3 and g.extras == []  # main, gpu and utility still run
+
+
+def test_cli_end_extra(capsys, electron_probe):
+    assert ms.main(["end-extra", "ms-electron-probe"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["left"] == 0 and len(out["ended"]) == 1 and "start it again" in out["note"]
+    assert electron_probe.poll() is None
+    assert ms.main(["end-extra", "ms-electron-probe"]) == 2  # nothing left to end
+    assert "no extra copy" in json.loads(capsys.readouterr().out)["error"]
+    assert ms.main(["end-extra", "no-such-app-xyz"]) == 2
+    capsys.readouterr()

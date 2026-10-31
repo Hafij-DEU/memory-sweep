@@ -6,6 +6,9 @@ Usage:
                                    settings, memory (Memory Optimization) or about
   memory-sweep report [--json]     print a summary
   memory-sweep end KEY [--force]   end every instance of one app (KEY from report --json)
+  memory-sweep end-extra KEY [--force]
+                                   end only the extra copies an app runs as helpers
+                                   (like MeshDrop's clipboard helper); the app keeps running
 """
 import json
 import os
@@ -27,7 +30,7 @@ AI_STATEMENT = (
     "acceptance criteria in natural language. An AI coding agent (Claude Code, Anthropic, model "
     "Claude Opus) then inspected the system, wrote the code and tests, ran them, and fixed defects. "
     "The author reviewed the results and gave follow-up instructions.")
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 PROC = "/proc"
 UID = os.getuid()
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -43,8 +46,13 @@ NAMES = {
     "opera": "Opera", "claude-desktop": "Claude Desktop", "code": "VS Code",
     "gnome-shell": "GNOME Shell", "nautilus": "Files", "Xwayland": "Xwayland",
     "evolution-data-server": "Evolution data server", "gnome-software": "Software",
-    "snapd": "snapd", "packagekitd": "PackageKit",
+    "snapd": "snapd", "packagekitd": "PackageKit", "meshdrop-desktop": "MeshDrop",
 }
+# What a known app uses its extra copy for (see extra_copies).
+EXTRA_NOTES = {
+    "meshdrop-desktop": "MeshDrop's clipboard helper",
+}
+EXTRA_MIN = 20 << 20  # smaller extra copies are not suggested on the Overview
 HINTS = {
     "gradle-daemon": "Build daemon, starts again on the next build",
     "kotlin-daemon": "Build daemon, starts again on the next build",
@@ -314,6 +322,7 @@ class Group:
     def __init__(self, key, title):
         self.key, self.title = key, title
         self.instances = []
+        self.extras = []  # extra copies the app runs as helpers (see extra_copies)
         self.locked = None  # why it cannot be ended, or None
 
     @property
@@ -335,6 +344,63 @@ class Group:
     @property
     def hint(self):
         return HINTS.get(self.key, "")
+
+    @property
+    def extra_note(self):
+        return EXTRA_NOTES.get(self.key, f"A second copy of {self.title}")
+
+
+def chromium_type(p):
+    """The --type= of a Chromium or Electron helper process, or None for a main process."""
+    argv = p.argv
+    if len(argv) == 1 and " " in argv[0]:
+        argv = argv[0].split()  # Chromium rewrites its process title into one string
+    for a in argv[1:]:
+        if a.startswith("--type="):
+            return a[7:]
+    return None
+
+
+def extra_copies(inst):
+    """Extra copies of a Chromium or Electron app inside one instance.
+
+    Such an app runs one main process that starts helpers with --type= (renderer, GPU,
+    network, zygote). Some apps also start a second full copy of themselves as a helper,
+    MeshDrop for its clipboard. That copy brings its own GPU, network and zygote
+    processes. It is a main process (no --type=, has --type= children) whose parent is
+    a main process of the same program. The instance root is never one."""
+    kids = defaultdict(list)
+    for p in inst.tree:
+        kids[p.ppid].append(p)
+
+    def program(p):
+        return p.exe or (p.argv[0] if p.argv else p.comm)
+
+    def is_main(p):
+        return chromium_type(p) is None and any(chromium_type(c) for c in kids[p.pid])
+
+    def subtree(root):
+        out, stack = [], [root]
+        while stack:
+            p = stack.pop()
+            out.append(p)
+            stack.extend(kids[p.pid])
+        return out
+
+    same_app = {p.pid for p in inst.procs}  # not the other apps a launcher started
+    found, stack = [], [inst.root]
+    while stack:
+        p = stack.pop()
+        for c in kids[p.pid]:
+            if c.pid not in same_app:
+                continue
+            if is_main(p) and is_main(c) and program(c) == program(p):
+                tree = subtree(c)  # a copy inside a copy is ended with it
+                found.append(Instance(c, tree, tree))
+            else:
+                stack.append(c)
+    found.sort(key=lambda i: -i.mem)
+    return found
 
 
 def build_groups(procs, keep=frozenset()):
@@ -374,6 +440,7 @@ def build_groups(procs, keep=frozenset()):
             groups[keys[p.pid]].instances.append(Instance(p, walk(p, True), walk(p, False)))
     for g in groups.values():
         g.instances.sort(key=lambda i: -i.mem)
+        g.extras = [e for i in g.instances for e in extra_copies(i)]
         ps = g.procs
         if any(is_protected(p) for p in ps):
             g.locked = "Needed by your desktop session"
@@ -603,6 +670,7 @@ class Snapshot:
         self.zram = zram()
         self.mounts = ram_mounts()
         self.swaps = swaps()
+        self.keep = keep
         self.groups = build_groups(scan_procs(), keep)
         self.time = time.time()
 
@@ -639,6 +707,13 @@ class Snapshot:
             where = " and ".join(mp for mp, u, _ in self.mounts if u >= 50 << 20) or "/tmp"
             tips.append(("files", f"{fmt_size(in_ram)} of files in {where} are held in RAM",
                          "files", None))
+        for g in self.groups:
+            extras = [e for e in g.extras if not instance_locked(e, self.keep)]
+            mem = sum(e.mem for e in extras)
+            if mem >= EXTRA_MIN:
+                copy = "an extra copy" if len(extras) == 1 else f"{len(extras)} extra copies"
+                tips.append(("extra", f"{g.title} runs {copy} of itself as a helper, using "
+                             f"{fmt_size(mem)}", "apps", g.key))
         for g in self.groups:
             if g.key in ("gradle-daemon", "kotlin-daemon") and not g.locked:
                 tips.append(("end", f"{g.title} uses {fmt_size(g.mem)} and starts again on the next build",
@@ -873,6 +948,25 @@ def end_app(key, force=False):
     return 1 if left else 0
 
 
+def end_extra(key, force=False):
+    """End the extra copies of app `key` (see extra_copies), never the app itself.
+    Prints JSON; exit 0 = gone, 1 = some processes still run, 2 = nothing to end."""
+    keep = frozenset(self_and_ancestors())
+    group = next((g for g in build_groups(scan_procs(), keep) if g.key == key), None)
+    extras = [e for e in group.extras if not instance_locked(e, keep)] if group else []
+    if not extras:
+        why = "No such app is running" if group is None else \
+            f"{group.title} runs no extra copy that can be ended"
+        print(json.dumps({"key": key, "error": why}))
+        return 2
+    left = stop(extras, force=force, keep=keep)
+    print(json.dumps({"key": key, "title": group.title, "ended": [e.root.pid for e in extras],
+                      "freed": sum(e.mem for e in extras), "left": len(left),
+                      "note": f"{group.title} may start it again. The lasting fix belongs in "
+                              f"{group.title} itself."}))
+    return 1 if left else 0
+
+
 def report(as_json=False):
     snap = Snapshot(self_and_ancestors())
     items = [i for i in list_items() if i.size >= 10 << 20]
@@ -883,7 +977,10 @@ def report(as_json=False):
             "zram": [{"device": d, "stored": s, "ram": r} for d, s, r in snap.zram],
             "ram_folders": [{"path": mp, "used": u, "size": t} for mp, u, t in snap.mounts],
             "apps": [{"key": g.key, "title": g.title, "ram": g.ram, "swap": g.swap,
-                      "processes": len(g.procs), "instances": len(g.instances), "locked": g.locked}
+                      "processes": len(g.procs), "instances": len(g.instances), "locked": g.locked,
+                      "extras": [{"pid": e.root.pid, "ram": e.ram, "swap": e.swap,
+                                  "processes": len(e.tree), "note": g.extra_note,
+                                  "locked": instance_locked(e, snap.keep)} for e in g.extras]}
                      for g in snap.groups if g.mem >= SMALL_GROUP],
             "files": [{"path": i.path, "size": i.size, "mine": i.own, "in_use": i.in_use,
                        "note": i.note} for i in items],
@@ -903,6 +1000,9 @@ def report(as_json=False):
         extra = f", {n} instances" if n > 1 else ""
         n = len(g.procs)
         print(f"  {fmt_size(g.mem):>9}  {g.title} ({n} process{'es' if n != 1 else ''}{extra})")
+        for e in g.extras:
+            print(f"  {fmt_size(e.mem):>9}    of it: extra copy, PID {e.root.pid} ({g.extra_note}); "
+                  f"end it with: memory-sweep end-extra {g.key}")
     hidden = hidden_usage(list_items(), snap.mounts)
     for mp, n in hidden.items():
         print(f"      {mp}: {fmt_size(n)} of it is not visible as files (kept open by running apps)")
@@ -1595,7 +1695,7 @@ def run_gui(page):
                 self.tips_box.append(c)
 
         def _tip_card(self, snap, index, kind, text, page, key):
-            icon = {"files": "folder-symbolic", "end": "process-stop-symbolic",
+            icon = {"files": "folder-symbolic", "end": "process-stop-symbolic", "extra": "edit-copy-symbolic",
                     "zram": "ms-zram-symbolic"}.get(kind, "view-grid-symbolic")
             color = ("blue", "purple", "green", "orange")[index % 4]
             c = Gtk.Box(orientation=V, spacing=12, css_classes=["ms-row"])
@@ -1609,6 +1709,10 @@ def run_gui(page):
                 grp = next(g for g in snap.groups if g.key == key)
                 b = Gtk.Button(label="End", css_classes=["ms-soft", "red"], margin_start=54)
                 b.connect("clicked", lambda *_: self.confirm_end(grp, grp.instances))
+            elif kind == "extra":
+                grp = next(g for g in snap.groups if g.key == key)
+                b = Gtk.Button(label="End extra copy", css_classes=["ms-soft", "red"], margin_start=54)
+                b.connect("clicked", lambda *_: self.confirm_extra(grp))
             else:
                 b = Gtk.Button(label="Set up" if kind == "zram" else "Review",
                                css_classes=["ms-soft", "green" if kind == "zram" else "blue"], margin_start=54)
@@ -1842,6 +1946,9 @@ def run_gui(page):
                     row.add_suffix(row.size)
                     row.end_btn = end_button(lambda r=row: self.confirm_end(r.group, r.group.instances))
                     row.add_suffix(row.end_btn)
+                    row.extra_btn = Gtk.Button(valign=CENTER, css_classes=["ms-soft", "orange"])
+                    row.extra_btn.connect("clicked", lambda _b, r=row: self.confirm_extra(r.group))
+                    row.add_suffix(row.extra_btn)
                     row.inst_rows = {}
                     row.inst_order = []
                     self.group_rows[g.key] = row
@@ -1857,6 +1964,9 @@ def run_gui(page):
                     parts.append(f"{ni} instances")
                 if g.swap >= 10 << 20:
                     parts.append(f"{fmt_size(g.swap)} in swap")
+                extras = [e for e in g.extras if not instance_locked(e, keep)]
+                if extras:
+                    parts.append(f"extra copy uses {fmt_size(sum(e.mem for e in extras))}")
                 parts.append(g.locked or g.hint)
                 row.set_subtitle(" · ".join(p for p in parts if p))
                 row.size.set_label(fmt_size(g.mem))
@@ -1864,6 +1974,12 @@ def run_gui(page):
                 row.end_btn.set_visible(not g.locked)
                 row.end_btn.set_sensitive(not busy)
                 row.end_btn.set_label("Ending…" if busy else ("End all" if ni > 1 else "End"))
+                extra_busy = bool(extras) and all(e.id in self.busy for e in extras)
+                row.extra_btn.set_visible(bool(extras))
+                row.extra_btn.set_sensitive(not extra_busy and not busy)
+                row.extra_btn.set_label("Ending…" if extra_busy else
+                                        "End extra copy" if len(extras) <= 1 else "End extra copies")
+                row.extra_btn.set_tooltip_text(f"{g.extra_note}. {g.title} keeps running.")
                 self._apply_instances(row, g)
             for key in list(self.group_rows):
                 if key not in seen:
@@ -1875,7 +1991,7 @@ def run_gui(page):
                                         "search to find them" if small else "")
 
         def _apply_instances(self, row, g):
-            order = [i.id for i in g.instances]
+            order = [i.id for i in g.instances] + [("extra",) + e.id for e in g.extras]
             if order != row.inst_order:
                 for r in row.inst_rows.values():
                     row.remove(r)
@@ -1888,6 +2004,16 @@ def run_gui(page):
                     r.add_suffix(r.end_btn)
                     row.add_row(r)
                     row.inst_rows[inst.id] = r
+                for e in g.extras:
+                    r = Adw.ActionRow(use_markup=False, subtitle_lines=2)
+                    r.add_prefix(Gtk.Image(icon_name="edit-copy-symbolic", css_classes=["dim-label"]))
+                    r.size = size_label()
+                    r.add_suffix(r.size)
+                    r.end_btn = end_button(lambda r=r: self.confirm_extra(row.group, [r.inst]),
+                                           "End copy")
+                    r.add_suffix(r.end_btn)
+                    row.add_row(r)
+                    row.inst_rows[("extra",) + e.id] = r
                 row.inst_order = order
             now = time.time()
             for inst in g.instances:
@@ -1905,6 +2031,47 @@ def run_gui(page):
                 r.end_btn.set_visible(not locked)
                 r.end_btn.set_sensitive(not busy)
                 r.end_btn.set_label("Ending…" if busy else "End")
+            for e in g.extras:
+                r = row.inst_rows[("extra",) + e.id]
+                r.inst = e
+                r.set_title(f"Extra copy · PID {e.root.pid} · {len(e.tree)} processes")
+                r.set_subtitle(f"{g.extra_note}, inside PID {e.root.ppid}. Ending it leaves "
+                               f"{g.title} running; {g.title} may start it again.")
+                r.set_tooltip_text(" ".join(e.root.argv) or e.root.comm)
+                r.size.set_label(fmt_size(e.mem))
+                busy = e.id in self.busy
+                r.end_btn.set_visible(not instance_locked(e, keep))
+                r.end_btn.set_sensitive(not busy)
+                r.end_btn.set_label("Ending…" if busy else "End copy")
+
+        def confirm_extra(self, group, extras=None):
+            """End the extra copies an app runs as helpers (see extra_copies), not the app."""
+            extras = [e for e in (group.extras if extras is None else extras)
+                      if not instance_locked(e, keep) and e.id not in self.busy]
+            if not extras:
+                return
+            mem = sum(e.mem for e in extras)
+            swap = sum(e.swap for e in extras)
+            procs = sum(len(e.tree) for e in extras)
+            pids = ", ".join(str(e.root.pid) for e in extras)
+            what = (f"the extra copy of {group.title}" if len(extras) == 1
+                    else f"{len(extras)} extra copies of {group.title}")
+            in_swap = f", {fmt_size(swap)} of it in swap" if swap >= 10 << 20 else ""
+            dlg = Adw.AlertDialog(
+                heading=f"End {what}?",
+                body=f"{group.extra_note} (PID {pids}) is a second {group.title} with its own GPU, "
+                     f"network and zygote processes: {procs} process{'es' if procs != 1 else ''} "
+                     f"using about {fmt_size(mem)}{in_swap}. {group.title} itself keeps running.\n\n"
+                     f"{group.title} may start the copy again after a few seconds. "
+                     f"The lasting fix belongs in {group.title} itself.")
+            dlg.add_response("cancel", "Cancel")
+            dlg.add_response("end", "End copy")
+            dlg.set_response_appearance("end", Adw.ResponseAppearance.DESTRUCTIVE)
+            dlg.set_default_response("cancel")
+            dlg.set_close_response("cancel")
+            dlg.connect("response", lambda d, r: r == "end" and self.end(
+                what, extras, mem, note=f"{group.title} may start it again"))
+            dlg.present(self)
 
         def confirm_end(self, group, instances):
             instances = [i for i in instances if not instance_locked(i, keep) and i.id not in self.busy]
@@ -1927,7 +2094,7 @@ def run_gui(page):
             dlg.connect("response", lambda d, r: r == "end" and self.end(what, instances, mem))
             dlg.present(self)
 
-        def end(self, what, instances, mem, force=False):
+        def end(self, what, instances, mem, force=False, note=None):
             for i in instances:
                 self.busy.add(i.id)
             if self.snap:
@@ -1943,9 +2110,10 @@ def run_gui(page):
                 if left:
                     t = Adw.Toast(title=f"{what} is still running ({len(left)} processes)", timeout=10)
                     t.set_button_label("Force quit")
-                    t.connect("button-clicked", lambda *_: self.end(what, instances, mem, force=True))
+                    t.connect("button-clicked", lambda *_: self.end(what, instances, mem, True, note))
                 else:
-                    t = Adw.Toast(title=f"Ended {what}, about {fmt_size(mem)} freed")
+                    t = Adw.Toast(title=f"Ended {what}, about {fmt_size(mem)} freed"
+                                  + (f". {note}" if note else ""), timeout=8 if note else 5)
                 self.toasts.add_toast(t)
                 self.refresh()
                 return False
@@ -2646,6 +2814,8 @@ def main(argv):
         return 0
     if argv[:1] == ["end"] and len(argv) >= 2:
         return end_app(argv[1], force="--force" in argv)
+    if argv[:1] == ["end-extra"] and len(argv) >= 2:
+        return end_extra(argv[1], force="--force" in argv)
     if argv[:1] in (["-h"], ["--help"]):
         print(__doc__.strip())
         return 0

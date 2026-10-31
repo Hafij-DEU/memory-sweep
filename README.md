@@ -12,6 +12,12 @@ narrow windows too: the columns stack and the sidebar folds away.
   PSS, so shared memory is not counted twice. Expand an app to see each running instance with its
   PID, age and command. **End** asks it to quit (SIGTERM to the main process, then to leftover
   children); if it keeps running, the toast offers **Force quit** (SIGKILL).
+- **Extra copies**: some Electron apps run a second full copy of themselves as a helper, with its
+  own GPU, network and zygote processes (MeshDrop does this for its clipboard). Memory Sweep finds
+  such a copy (a main process without `--type=` under a main process of the same program) and
+  shows what it costs in PSS. **End extra copy** (Apps row, or the Overview suggestion when the
+  copy uses 20 MB or more) ends only that copy; the app keeps running. The app may start the copy
+  again after a few seconds, so the lasting fix belongs in the app itself.
 - **Files in RAM**: `/tmp` and `/dev/shm` are tmpfs, so their files take RAM (or swap). Browse
   them biggest first and remove your own files. Folders that a running program seems to use are
   marked "in use".
@@ -42,6 +48,8 @@ memory-sweep                    open the window
 memory-sweep --page PAGE        open on overview, apps, files, settings, memory or about
 memory-sweep report [--json]    print a summary
 memory-sweep end KEY [--force]  end one app (KEY from report --json)
+memory-sweep end-extra KEY [--force]
+                                end only the app's extra copies; the app keeps running
 ```
 
 ## Build
