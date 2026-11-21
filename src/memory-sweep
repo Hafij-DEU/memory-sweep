@@ -79,11 +79,25 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 
 
 def _read(path):
+    # /proc text (cmdline, comm) may hold any bytes: one odd process must not break a scan
     try:
-        with open(path) as f:
+        with open(path, errors="replace") as f:
             return f.read()
     except OSError:
         return ""
+
+
+def safe_text(s):
+    """`s` (maybe a path with undecodable bytes) made safe for print and GTK."""
+    return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace") \
+        if isinstance(s, str) else str(s)
+
+
+def clamp_refresh(v):
+    try:
+        return min(3600, max(1, int(v)))
+    except (TypeError, ValueError, OverflowError):
+        return SETTINGS["refresh"]
 
 
 def fmt_size(n):
@@ -206,7 +220,7 @@ def read_proc(pid, btime=None):
         if "Pss" in roll:
             ram, swap = roll["Pss"], roll.get("SwapPss", swap)
     try:
-        exe = os.readlink(base + "/exe").removesuffix(" (deleted)")
+        exe = safe_text(os.readlink(base + "/exe").removesuffix(" (deleted)"))
     except OSError:
         exe = ""
     argv = [a for a in _read(base + "/cmdline").split("\0") if a]
@@ -232,6 +246,22 @@ def _stem(path):
     return b
 
 
+def _inline_code(interp, a):
+    """True when argument a makes interp run code given on the command line
+    (python -c / -Bc, bash -c / -lc, node -e, perl -e / -ne, ruby -e)."""
+    if interp.startswith("python"):
+        return re.match(r"-[bBdEiIOPqRsSuv]*c", a) is not None
+    if interp in ("bash", "sh", "dash"):
+        return re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", a) is not None
+    if interp in ("node", "bun"):
+        return a in ("-e", "--eval", "-p", "--print")
+    if interp == "perl":
+        return re.fullmatch(r"-[a-zA-Z]*[eE]", a) is not None
+    if interp == "ruby":
+        return a == "-e"
+    return False
+
+
 def _script(interp, args):
     """The script or program an interpreter runs, from its arguments."""
     skip = False
@@ -243,8 +273,8 @@ def _script(interp, args):
             return args[i + 1]
         if interp == "java" and a == "-jar" and i + 1 < len(args):
             return _stem(args[i + 1])
-        if interp in ("bash", "sh", "dash") and a == "-c":
-            return None
+        if _inline_code(interp, a):
+            return None  # "-c code" / "-lc code": the code is no script name
         if a in ("-cp", "-classpath", "--class-path", "-p", "--module-path", "-X", "-W", "-r", "--require"):
             skip = True
             continue
@@ -515,6 +545,14 @@ class Item:
     @property
     def name(self):
         return os.path.basename(self.path)
+
+    @property
+    def shown_name(self):
+        return safe_text(self.name)
+
+    @property
+    def shown_path(self):
+        return safe_text(self.path)
 
 
 def measure(path):
@@ -829,13 +867,22 @@ def swap_status():
     }
 
 
+def _file_gb(size):
+    """Swap file size in GB as the form holds it: whole GB as an int, anything else
+    to 0.01 GB, so a 1.4 GB file is not mistaken for the 1 GB a user may pick."""
+    if not size:
+        return 0
+    gb = max(0.01, round(size / (1 << 30), 2))
+    return int(gb) if gb == int(gb) else gb
+
+
 def swap_form(st):
     """The form values that match the system as it is now."""
     return {
         "tools": None,  # None, "install", "reinstall" or "remove"
         "zram": st["zram_percent"] if st["zram_on"] else 0,
         "algo": st["algo"],
-        "file": max(1, round(st["file_size"] / (1 << 30))) if st["file_size"] else 0,
+        "file": _file_gb(st["file_size"]),
         "zswap": bool(st["zswap"]),
         "swappiness": st["swappiness"],
         "cache_pressure": st["cache_pressure"],
@@ -920,6 +967,7 @@ def load_settings():
         s.update({k: v for k, v in data.items() if k in SETTINGS and type(v) is type(SETTINGS[k])})
     except (OSError, ValueError, AttributeError):
         pass
+    s["refresh"] = clamp_refresh(s["refresh"])
     return s
 
 
@@ -1009,7 +1057,7 @@ def report(as_json=False):
     if items:
         print("\nFiles in RAM")
         for i in items[:15]:
-            print(f"  {fmt_size(i.size):>9}  {i.path}" + (f"  [{i.note}]" if i.note else ""))
+            print(f"  {fmt_size(i.size):>9}  {i.shown_path}" + (f"  [{i.note}]" if i.note else ""))
     tips = snap.tips()
     if tips:
         print("\nSuggestions")
@@ -1856,7 +1904,7 @@ def run_gui(page):
         def _restart_timer(self):
             if self.timer:
                 GLib.source_remove(self.timer)
-            self.timer = GLib.timeout_add_seconds(self.settings["refresh"], self._tick)
+            self.timer = GLib.timeout_add_seconds(clamp_refresh(self.settings["refresh"]), self._tick)
 
         def _tick(self):
             if self.get_visible():
@@ -2154,14 +2202,15 @@ def run_gui(page):
         def open_folder(self, folder):
             self.folder = folder
             self.files_loaded = True
-            self.folder_label.set_label(folder or "All RAM folders: " + ", ".join(FILE_ROOTS))
+            self.folder_label.set_label(safe_text(folder) if folder else "All RAM folders: " + ", ".join(FILE_ROOTS))
             self.up_btn.set_sensitive(folder is not None)
             self.files_spinner.set_visible(True)
 
             def work():
                 try:
                     items = list_items(folder)
-                except OSError:
+                except Exception as e:  # never leave the spinner running
+                    print("file scan failed:", e, file=sys.stderr)
                     items = []
                 GLib.idle_add(show, items)
 
@@ -2190,11 +2239,11 @@ def run_gui(page):
             shown = [i for i in items if folder or i.size >= SMALL_ITEM][:300]
             now = time.time()
             for it in shown:
-                row = Adw.ActionRow(title=it.name, use_markup=False, subtitle_lines=2)
+                row = Adw.ActionRow(title=it.shown_name, use_markup=False, subtitle_lines=2)
                 row.add_prefix(Gtk.Image(icon_name="folder-symbolic" if it.is_dir else "text-x-generic-symbolic"))
                 parts = []
                 if not folder:
-                    parts.append(os.path.dirname(it.path))
+                    parts.append(safe_text(os.path.dirname(it.path)))
                 if it.note:
                     parts.append(it.note)
                 if it.mtime:
@@ -2225,13 +2274,13 @@ def run_gui(page):
             if why:
                 self.toasts.add_toast(Adw.Toast(title=why))
                 return
-            body = f"{fmt_size(it.size)} at {it.path} will be deleted for good."
+            body = f"{fmt_size(it.size)} at {it.shown_path} will be deleted for good."
             if it.in_use:
                 body += "\n\nA running program seems to use it. Removing it may break that program."
             elif it.sockets:
                 body += f"\n\nIt holds {it.sockets} socket{'s' if it.sockets != 1 else ''}: " \
                         "programs talk through these, and may stop working."
-            dlg = Adw.AlertDialog(heading=f"Remove {it.name}?", body=body)
+            dlg = Adw.AlertDialog(heading=f"Remove {it.shown_name}?", body=body)
             dlg.add_response("cancel", "Cancel")
             dlg.add_response("remove", "Remove")
             dlg.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
@@ -2246,10 +2295,10 @@ def run_gui(page):
             def work():
                 try:
                     left = remove(it.path)
-                    msg = f"Removed {it.name}, {fmt_size(it.size)} freed" if not left else \
-                        f"Removed most of {it.name}; {left} items could not be deleted"
+                    msg = f"Removed {it.shown_name}, {fmt_size(it.size)} freed" if not left else \
+                        f"Removed most of {it.shown_name}; {left} items could not be deleted"
                 except OSError as e:
-                    msg = f"Could not remove {it.name}: {e.strerror or e}"
+                    msg = f"Could not remove {it.shown_name}: {e.strerror or e}"
                 GLib.idle_add(done, msg)
 
             def done(msg):
@@ -2439,6 +2488,7 @@ def run_gui(page):
                          "lz4 is the quickest.", self.algo, None, "ms-zram-symbolic", "purple")
             self.file_adj, spin, scale = self._slider(
                 1, 64, 1, 4, ((1, "1"), (16, "16"), (32, "32"), (48, "48"), (64, "64 GB")))
+            self.file_spin = spin
             self.file_sub = self._option(left, "Swap file (GB)", "", spin, scale,
                                          "drive-harddisk-symbolic", "cyan")
             self.zswap_sw = Gtk.Switch()
@@ -2545,7 +2595,9 @@ def run_gui(page):
                 self.zram_adj.set_value(f["zram"])
                 self.algo.set_selected(ALGOS.index(f["algo"]))
                 # No swap file yet: 0 keeps "no change" until the slider moves.
-                self.file_adj.set_lower(1 if f["file"] else 0)
+                self.file_adj.set_lower(min(1, f["file"]) if f["file"] else 0)
+                # a file that isn't whole GB shows its real size (1.4), not "1"
+                self.file_spin.set_digits(0 if f["file"] == int(f["file"]) else 2)
                 self.file_adj.set_value(f["file"])
                 self.zswap_sw.set_active(f["zswap"])
                 self.swappiness_adj.set_value(f["swappiness"])
@@ -2559,10 +2611,20 @@ def run_gui(page):
                 return
             self.form.update({
                 "zram": int(self.zram_adj.get_value()), "algo": ALGOS[self.algo.get_selected()],
-                "file": int(self.file_adj.get_value()), "zswap": self.zswap_sw.get_active(),
+                "file": self._file_value(), "zswap": self.zswap_sw.get_active(),
                 "swappiness": int(self.swappiness_adj.get_value()),
                 "cache_pressure": int(self.cache_adj.get_value())})
             self._update_pending()
+
+        def _file_value(self):
+            value = self.file_adj.get_value()
+            if value == self.status_file_gb():
+                return value  # still the real size: no change
+            self.file_spin.set_digits(0)
+            return int(round(value))
+
+        def status_file_gb(self):
+            return _file_gb(self.status["file_size"]) if self.status else 0
 
         def _pick_tools(self, action):
             self.form["tools"] = None if self.form["tools"] == action else action

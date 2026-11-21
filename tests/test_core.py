@@ -434,3 +434,64 @@ def test_cli_end_extra(capsys, electron_probe):
     assert "no extra copy" in json.loads(capsys.readouterr().out)["error"]
     assert ms.main(["end-extra", "no-such-app-xyz"]) == 2
     capsys.readouterr()
+
+
+def test_nonutf8_proc_text_does_not_break_scan(tmp_path, monkeypatch):
+    # a process whose cmdline/comm hold invalid UTF-8 must not crash read_proc or busy_markers
+    d = tmp_path / "4242"
+    d.mkdir()
+    (d / "stat").write_bytes(b"4242 (caf\xe9) S 1 " + b"0 " * 17 + b"100 0 0\n")
+    (d / "status").write_bytes(b"Name:\tcaf\xe9\nUid:\t-5\t-5\t-5\t-5\nVmRSS:\t4 kB\n")
+    (d / "cmdline").write_bytes(b"/x/probe\0caf\xe9.txt\0")
+    os.symlink(str(tmp_path), d / "cwd")
+    monkeypatch.setattr(ms, "PROC", str(tmp_path))
+    p = ms.read_proc(4242, btime=0)
+    assert p.comm == "caf�" and p.argv == ["/x/probe", "caf�.txt"]
+    assert ms.scan_procs()[0].pid == 4242
+    ms.busy_markers()
+    ms.label(p)
+
+
+def test_nonutf8_file_name_is_display_safe(tmp_path, monkeypatch, capsys):
+    name = os.fsdecode(b"caf\xe9.bin")
+    (tmp_path / name).write_bytes(b"x" * 4096)
+    it = ms.list_items(str(tmp_path), markers=(set(), set()))[0]
+    assert it.name == name and os.path.exists(it.path)  # real path kept for removal
+    it.shown_name.encode("utf-8")
+    it.shown_path.encode("utf-8")
+    assert ms.safe_text(name) == "caf�.bin"
+    it.size = 11 << 20
+    monkeypatch.setattr(ms, "list_items", lambda *a, **k: [it])
+    ms.report()
+    out = capsys.readouterr().out
+    out.encode("utf-8")
+    assert "caf�.bin" in out
+
+
+@pytest.mark.parametrize("value,want", [(-1, 1), (0, 1), (5, 5), (10**12, 3600), ("x", 5)])
+def test_refresh_is_clamped(tmp_path, monkeypatch, value, want):
+    assert ms.clamp_refresh(value) == want
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    ms.save_settings(dict(ms.SETTINGS, refresh=value))
+    assert ms.load_settings()["refresh"] == want
+
+
+def test_labels_inline_code_is_not_a_script():
+    py = ms.label(proc(1, 0, "/usr/bin/python3", ["python3", "-c", "import time; time.sleep(9)"]))
+    assert py == ("python3", "python3")
+    assert ms.label(proc(1, 0, "/usr/bin/python3", ["python3", "-Bc", "exec(open('/a/b.py').read())"]))[0] == "python3"
+    assert ms.label(proc(1, 0, "/usr/bin/bash", ["bash", "-lc", "make all"]))[0] == "bash"
+    assert ms.label(proc(1, 0, "/usr/bin/node", ["node", "-e", "setTimeout(()=>0,9)"]))[0] == "node"
+    # scripts still get their own name
+    assert ms.label(proc(1, 0, "/usr/bin/bash", ["bash", "-l", "/x/run.sh"]))[0] == "bash:run"
+    assert ms.label(proc(1, 0, "/usr/bin/python3", ["python3", "-u", "/x/tool.py"]))[0] == "python:tool"
+
+
+def test_swap_file_not_whole_gb():
+    st = swap_state(file_size=int(1.4 * (1 << 30)))
+    form = ms.swap_form(st)
+    assert form["file"] == 1.4
+    assert ms.plan_changes(st, form) == []
+    # picking 1 GB really shrinks it
+    assert ms.plan_changes(st, dict(form, file=1)) == ["file=1"]
+    assert ms.swap_form(swap_state(file_size=4 << 30))["file"] == 4
