@@ -30,7 +30,7 @@ AI_STATEMENT = (
     "acceptance criteria in natural language. An AI coding agent (Claude Code, Anthropic, model "
     "Claude Opus) then inspected the system, wrote the code and tests, ran them, and fixed defects. "
     "The author reviewed the results and gave follow-up instructions.")
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 PROC = "/proc"
 UID = os.getuid()
 CLK_TCK = os.sysconf("SC_CLK_TCK")
